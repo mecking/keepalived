@@ -38,6 +38,7 @@
 #include "main.h"
 #include "memory.h"
 #include "parser.h"
+#include "bitops.h"
 #include "vrrp_netlink.h"
 #include "vrrp_if.h"
 #ifdef _WITH_SNMP_
@@ -55,7 +56,7 @@ stop_check(void)
 	thread_destroy_master(master);
 	free_checkers_queue();
 	free_ssl();
-	if (!(debug & 16))
+	if (!__test_bit(DONT_RELEASE_IPVS_BIT, &debug))
 		clear_services();
 	ipvs_stop();
 #ifdef _WITH_SNMP_
@@ -90,7 +91,10 @@ static void
 start_check(void)
 {
 	/* Initialize sub-system */
-	ipvs_start();
+	if (ipvs_start() != IPVS_SUCCESS) {
+		stop_check();
+		return;
+	}
 	init_checkers_queue();
 #ifdef _WITH_VRRP_
 	init_interface_queue();
@@ -98,7 +102,7 @@ start_check(void)
 #endif
 #ifdef _WITH_SNMP_
 	if (!reload && snmp)
-		check_snmp_agent_init();
+		check_snmp_agent_init(snmp_socket);
 #endif
 
 	/* Parse configuration file */
@@ -109,6 +113,7 @@ start_check(void)
 		stop_check();
 		return;
 	}
+	init_global_data(global_data);
 
 	/* Post initializations */
 	log_message(LOG_INFO, "Configuration is using : %lu Bytes", mem_allocated);
@@ -119,11 +124,15 @@ start_check(void)
 		return;
 	}
 
+	/* fill 'vsg' members of the virtual_server_t structure.
+	 * We must do that after parsing config, because
+	 * vs and vsg declarations may appear in any order
+	 */
+	link_vsg_to_vs();
+
 	/* Processing differential configuration parsing */
-	if (reload) {
+	if (reload)
 		clear_diff_services();
-		copy_srv_states();
-	}
 
 	/* Initialize IPVS topology */
 	if (!init_services()) {
@@ -132,7 +141,7 @@ start_check(void)
 	}
 
 	/* Dump configuration */
-	if (debug & 4) {
+	if (__test_bit(DUMP_CONF_BIT, &debug)) {
 		dump_global_data(global_data);
 		dump_check_data(check_data);
 	}
@@ -187,6 +196,9 @@ reload_check_thread(thread_t * thread)
 	signal_handler_destroy();
 
 	/* Destroy master thread */
+#ifdef _WITH_VRRP_
+	kernel_netlink_close();
+#endif
 	thread_destroy_master(master);
 	master = thread_make_master();
 	free_global_data(global_data);
@@ -231,7 +243,7 @@ check_respawn_thread(thread_t * thread)
 	}
 
 	/* We catch a SIGCHLD, handle it */
-	if (!(debug & 64)) {
+	if (!__test_bit(DONT_RESPAWN_BIT, &debug)) {
 		log_message(LOG_ALERT, "Healthcheck child process(%d) died: Respawning", pid);
 		start_check_child();
 	} else {
@@ -268,8 +280,8 @@ start_check_child(void)
 	}
 
 	/* Opening local CHECK syslog channel */
-	openlog(PROG_CHECK, LOG_PID | ((debug & 1) ? LOG_CONS : 0),
-		(log_facility==LOG_DAEMON) ? LOG_LOCAL2 : log_facility);
+	openlog(PROG_CHECK, LOG_PID | ((__test_bit(LOG_CONSOLE_BIT, &debug)) ? LOG_CONS : 0)
+			  , (log_facility==LOG_DAEMON) ? LOG_LOCAL2 : log_facility);
 
 	/* Child process part, write pidfile */
 	if (!pidfile_write(checkers_pidfile, getpid())) {

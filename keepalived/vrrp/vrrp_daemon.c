@@ -31,11 +31,13 @@
 #include "vrrp_parser.h"
 #include "vrrp_data.h"
 #include "vrrp.h"
+#include "vrrp_print.h"
 #include "global_data.h"
 #include "pidfile.h"
 #include "daemon.h"
 #include "logger.h"
 #include "signals.h"
+#include "bitops.h"
 #ifdef _WITH_LVS_
   #include "ipvswrapper.h"
 #endif
@@ -53,20 +55,15 @@ extern char *vrrp_pidfile;
 static void
 stop_vrrp(void)
 {
-	/* Destroy master thread */
 	signal_handler_destroy();
-	thread_destroy_master(master);
 
-	if (!(debug & 8))
+	if (!__test_bit(DONT_RELEASE_VRRP_BIT, &debug))
 		shutdown_vrrp_instances();
 
 	/* Clear static entries */
 	netlink_rtlist(vrrp_data->static_routes, IPROUTE_DEL);
 	netlink_iplist(vrrp_data->static_addresses, IPADDRESS_DEL);
 
-	free_interface_queue();
-	gratuitous_arp_close();
-	ndisc_close();
 #ifdef _WITH_SNMP_
 	if (snmp)
 		vrrp_snmp_agent_close();
@@ -75,16 +72,23 @@ stop_vrrp(void)
 	/* Stop daemon */
 	pidfile_rm(vrrp_pidfile);
 
+#ifdef _WITH_LVS_
+	if (vrrp_ipvs_needed()) {
+		/* Clean ipvs related */
+		ipvs_stop();
+	}
+#endif
+
 	/* Clean data */
 	free_global_data(global_data);
-	free_vrrp_sockpool(vrrp_data);
+	vrrp_dispatcher_release(vrrp_data);
 	free_vrrp_data(vrrp_data);
 	free_vrrp_buffer();
-
-#ifdef _WITH_LVS_
-	/* Clean ipvs related */
-	ipvs_stop();
-#endif
+	free_interface_queue();
+	kernel_netlink_close();
+	thread_destroy_master(master);
+	gratuitous_arp_close();
+	ndisc_close();
 
 #ifdef _DEBUG_
 	keepalived_free_final("VRRP Child process");
@@ -109,13 +113,9 @@ start_vrrp(void)
 	ndisc_init();
 #ifdef _WITH_SNMP_
 	if (!reload && snmp)
-		vrrp_snmp_agent_init();
+		vrrp_snmp_agent_init(snmp_socket);
 #endif
 
-#ifdef _WITH_LVS_
-	/* Initialize ipvs related */
-	ipvs_start();
-#endif
 	/* Parse configuration file */
 	global_data = alloc_global_data();
 	vrrp_data = alloc_vrrp_data();
@@ -125,6 +125,17 @@ start_vrrp(void)
 		stop_vrrp();
 		return;
 	}
+	init_global_data(global_data);
+
+#ifdef _WITH_LVS_
+	if (vrrp_ipvs_needed()) {
+		/* Initialize ipvs related */
+		if (ipvs_start() != IPVS_SUCCESS) {
+			stop_vrrp();
+			return;
+		}
+	}
+#endif
 
 	if (reload) {
 		clear_diff_saddresses();
@@ -135,7 +146,9 @@ start_vrrp(void)
 
 	/* Complete VRRP initialization */
 	if (!vrrp_complete_init()) {
-		stop_vrrp();
+		if (vrrp_ipvs_needed()) {
+			stop_vrrp();
+		}
 		return;
 	}
 
@@ -147,7 +160,7 @@ start_vrrp(void)
 	netlink_rtlist(vrrp_data->static_routes, IPROUTE_ADD);
 
 	/* Dump configuration */
-	if (debug & 4) {
+	if (__test_bit(DUMP_CONF_BIT, &debug)) {
 		dump_global_data(global_data);
 		dump_vrrp_data(vrrp_data);
 	}
@@ -167,6 +180,23 @@ sighup_vrrp(void *v, int sig)
 {
 	thread_add_event(master, reload_vrrp_thread, NULL, 0);
 }
+int print_vrrp_data(thread_t * thread);
+void
+sigusr1_vrrp(void *v, int sig)
+{
+	log_message(LOG_INFO, "Printing VRRP data for process(%d) on signal",
+		    getpid());
+	thread_add_event(master, print_vrrp_data, NULL, 0);
+}
+
+int print_vrrp_stats(thread_t * thread);
+void
+sigusr2_vrrp(void *v, int sig)
+{
+	log_message(LOG_INFO, "Printing VRRP stats for process(%d) on signal",
+		    getpid());
+	thread_add_event(master, print_vrrp_stats, NULL, 0);
+}
 
 /* Terminate handler */
 void
@@ -184,6 +214,8 @@ vrrp_signal_init(void)
 	signal_set(SIGHUP, sighup_vrrp, NULL);
 	signal_set(SIGINT, sigend_vrrp, NULL);
 	signal_set(SIGTERM, sigend_vrrp, NULL);
+	signal_set(SIGUSR1, sigusr1_vrrp, NULL);
+	signal_set(SIGUSR2, sigusr2_vrrp, NULL);
 	signal_ignore(SIGPIPE);
 }
 
@@ -199,6 +231,8 @@ reload_vrrp_thread(thread_t * thread)
 	signal_handler_destroy();
 
 	/* Destroy master thread */
+	vrrp_dispatcher_release(vrrp_data);
+	kernel_netlink_close();
 	thread_destroy_master(master);
 	master = thread_make_master();
 	free_global_data(global_data);
@@ -207,14 +241,16 @@ reload_vrrp_thread(thread_t * thread)
 	gratuitous_arp_close();
 	ndisc_close();
 
+#ifdef _WITH_LVS_
+	if (vrrp_ipvs_needed()) {
+		/* Clean ipvs related */
+		ipvs_stop();
+	}
+#endif
+
 	/* Save previous conf data */
 	old_vrrp_data = vrrp_data;
 	vrrp_data = NULL;
-
-#ifdef _WITH_LVS_
-	/* Clean ipvs related */
-	ipvs_stop();
-#endif
 
 	/* Reload the conf */
 	mem_allocated = 0;
@@ -222,15 +258,27 @@ reload_vrrp_thread(thread_t * thread)
 	signal_set(SIGCHLD, thread_child_handler, master);
 	start_vrrp();
 
-	/* Close sockpool */
-	free_vrrp_sockpool(old_vrrp_data);
-
 	/* free backup data */
 	free_vrrp_data(old_vrrp_data);
 	UNSET_RELOAD;
 
 	return 0;
 }
+
+int
+print_vrrp_data(thread_t * thread)
+{
+	vrrp_print_data();
+	return 0;
+}
+
+int
+print_vrrp_stats(thread_t * thread)
+{
+	vrrp_print_stats();
+	return 0;
+}
+
 
 /* VRRP Child respawning thread */
 int
@@ -249,7 +297,7 @@ vrrp_respawn_thread(thread_t * thread)
 	}
 
 	/* We catch a SIGCHLD, handle it */
-	if (!(debug & 64)) {
+	if (!__test_bit(DONT_RESPAWN_BIT, &debug)) {
 		log_message(LOG_ALERT, "VRRP child process(%d) died: Respawning", pid);
 		start_vrrp_child();
 	} else {
@@ -286,8 +334,8 @@ start_vrrp_child(void)
 	}
 
 	/* Opening local VRRP syslog channel */
-	openlog(PROG_VRRP, LOG_PID | ((debug & 1) ? LOG_CONS : 0),
-		(log_facility==LOG_DAEMON) ? LOG_LOCAL1 : log_facility);
+	openlog(PROG_VRRP, LOG_PID | ((__test_bit(LOG_CONSOLE_BIT, &debug)) ? LOG_CONS : 0)
+			 , (log_facility==LOG_DAEMON) ? LOG_LOCAL1 : log_facility);
 
 	/* Child process part, write pidfile */
 	if (!pidfile_write(vrrp_pidfile, getpid())) {

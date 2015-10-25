@@ -51,6 +51,8 @@ typedef struct _data {
 	struct sockaddr_storage		smtp_server;
 	long				smtp_connection_to;
 	list				email;
+	struct sockaddr_storage		vrrp_mcast_group4;
+	struct sockaddr_storage		vrrp_mcast_group6;
 #ifdef _WITH_SNMP_
 	int				enable_traps;
 #endif
@@ -62,6 +64,7 @@ extern data_t *global_data; /* Global configuration data */
 /* Prototypes */
 extern void alloc_email(char *);
 extern data_t *alloc_global_data(void);
+extern void init_global_data(data_t *);
 extern void free_global_data(data_t *);
 extern void dump_global_data(data_t *);
 

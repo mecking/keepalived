@@ -67,7 +67,7 @@ misc_check_handler(vector_t *strvec)
 
 	/* queue new checker */
 	queue_checker(free_misc_check, dump_misc_check, misc_check_thread,
-		      misck_checker);
+		      misck_checker, NULL);
 }
 
 void
@@ -99,6 +99,7 @@ install_misc_check_keyword(void)
 	install_keyword("misc_path", &misc_path_handler);
 	install_keyword("misc_timeout", &misc_timeout_handler);
 	install_keyword("misc_dynamic", &misc_dynamic_handler);
+	install_keyword("warmup", &warmup_handler);
 	install_sublevel_end();
 }
 
@@ -219,7 +220,8 @@ misc_check_child_thread(thread_t * thread)
 			 * Catch legacy case of status being 0 but misc_dynamic being set.
 			 */
 			if (misck_checker->dynamic == 1 && status != 0)
-				update_svr_wgt(status - 2, checker->vs, checker->rs);
+				update_svr_wgt(status - 2, checker->vs,
+					       checker->rs, 1);
 
 			/* everything is good */
 			if (!svr_checker_up(checker->id, checker->rs)) {

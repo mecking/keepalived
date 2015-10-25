@@ -26,15 +26,20 @@
 /* global includes */
 #include <stdio.h>
 #include <stdlib.h>
-#include <arpa/inet.h>
+#ifndef _USE_GNU
+#define __USE_GNU 1
+#endif
+#include <netinet/in.h>
 #include <string.h>
 #include <syslog.h>
 #include <linux/if_addr.h>
+#include <stdbool.h>
 
 /* local includes */
 #include "vrrp_if.h"
 #include "list.h"
 #include "vector.h"
+#include "utils.h"
 
 /* types definition */
 typedef struct _ip_address {
@@ -48,9 +53,12 @@ typedef struct _ip_address {
 		struct in6_addr sin6_addr;
 	} u;
 
-	interface_t		*ifp;	/* Interface owning IP address */
-	char			*label;	/* Alias name, e.g. eth0:1 */
-	int			set;	/* TRUE if addr is set */
+	interface_t		*ifp;			/* Interface owning IP address */
+	char			*label;			/* Alias name, e.g. eth0:1 */
+	int			set;			/* TRUE if addr is set */
+	bool			iptable_rule_set;	/* TRUE if iptable drop rule
+							 * set to addr
+							 */
 } ip_address_t;
 
 #define IPADDRESS_DEL 0
@@ -60,25 +68,29 @@ typedef struct _ip_address {
 /* Macro definition */
 #define IP_FAMILY(X)	(X)->ifa.ifa_family
 #define IP_IS6(X)	((X)->ifa.ifa_family == AF_INET6)
+#define IP_IS4(X)	((X)->ifa.ifa_family == AF_INET)
 #define IP_SIZE(X)      (IP_IS6(X) ? sizeof((X)->u.sin6_addr) : sizeof((X)->u.sin.sin_addr))
 
 #define IP4_ISEQ(X,Y)   ((X)->u.sin.sin_addr.s_addr == (Y)->u.sin.sin_addr.s_addr	&& \
 			 (X)->ifa.ifa_prefixlen     == (Y)->ifa.ifa_prefixlen		&& \
 			 (X)->ifa.ifa_index         == (Y)->ifa.ifa_index		&& \
-			 (X)->ifa.ifa_scope         == (Y)->ifa.ifa_scope)
+			 (X)->ifa.ifa_scope         == (Y)->ifa.ifa_scope		&& \
+			 string_equal((X)->label, (Y)->label))
 
 #define IP6_ISEQ(X,Y)   ((X)->u.sin6_addr.s6_addr32[0] == (Y)->u.sin6_addr.s6_addr32[0]	&& \
-			(X)->u.sin6_addr.s6_addr32[1] == (Y)->u.sin6_addr.s6_addr32[1]	&& \
-			(X)->u.sin6_addr.s6_addr32[2] == (Y)->u.sin6_addr.s6_addr32[2]	&& \
-			(X)->u.sin6_addr.s6_addr32[3] == (Y)->u.sin6_addr.s6_addr32[3]	&& \
-			(X)->ifa.ifa_prefixlen     == (Y)->ifa.ifa_prefixlen		&& \
-			(X)->ifa.ifa_index         == (Y)->ifa.ifa_index		&& \
-			(X)->ifa.ifa_scope         == (Y)->ifa.ifa_scope)
+			 (X)->u.sin6_addr.s6_addr32[1] == (Y)->u.sin6_addr.s6_addr32[1]	&& \
+			 (X)->u.sin6_addr.s6_addr32[2] == (Y)->u.sin6_addr.s6_addr32[2]	&& \
+			 (X)->u.sin6_addr.s6_addr32[3] == (Y)->u.sin6_addr.s6_addr32[3]	&& \
+			 (X)->ifa.ifa_prefixlen     == (Y)->ifa.ifa_prefixlen		&& \
+			 (X)->ifa.ifa_index         == (Y)->ifa.ifa_index		&& \
+			 (X)->ifa.ifa_scope         == (Y)->ifa.ifa_scope		&& \
+			 string_equal((X)->label, (Y)->label))
 
-#define IP_ISEQ(X,Y)    ((IP_FAMILY(X) == IP_FAMILY(Y)) ? (IP_IS6(X) ? IP6_ISEQ(X, Y) : IP4_ISEQ(X, Y)) : 0)
+#define IP_ISEQ(X,Y)    (((X) && (Y)) ? ((IP_FAMILY(X) == IP_FAMILY(Y)) ? (IP_IS6(X) ? IP6_ISEQ(X, Y) : IP4_ISEQ(X, Y)) : 0) : (((!(X) && (Y))||((X) && !(Y))) ? 0 : 1))
 
 /* prototypes */
 extern void netlink_iplist(list, int);
+extern void handle_iptable_rule_to_iplist(list, int, char *);
 extern void free_ipaddress(void *);
 extern char *ipaddresstos(ip_address_t *);
 extern void dump_ipaddress(void *);

@@ -31,12 +31,14 @@
 /* local includes */
 #include "scheduler.h"
 
-/* Checker argument structure  */
-typedef struct _tcp_checker {
-	struct sockaddr_storage		dst;
-	struct sockaddr_storage		bindto;
-	int				connection_to;
-} tcp_checker_t;
+typedef struct _tcp_check {
+	int n_retry;
+	long delay_before_retry;
+	int retry_it;
+} tcp_check_t;
+
+/* macro utility */
+#define FMT_TCP_RS(C) FMT_CHK(C)
 
 /* Prototypes defs */
 extern void install_tcp_check_keyword(void);

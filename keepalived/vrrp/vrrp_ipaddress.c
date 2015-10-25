@@ -27,11 +27,14 @@
 #include "logger.h"
 #include "memory.h"
 #include "utils.h"
+#include "bitops.h"
 
 /* Add/Delete IP address to a specific interface_t */
 static int
 netlink_ipaddress(ip_address_t *ipaddress, int cmd)
 {
+	struct ifa_cacheinfo cinfo;
+	char *addr_str;
 	int status = 1;
 	struct {
 		struct nlmsghdr n;
@@ -47,10 +50,44 @@ netlink_ipaddress(ip_address_t *ipaddress, int cmd)
 	req.ifa = ipaddress->ifa;
 
 	if (IP_IS6(ipaddress)) {
+		/* Mark IPv6 address as deprecated (rfc3484) in order to prevent
+		 * using VRRP VIP as source address in healthchecking use cases.
+		 */
+		if (ipaddress->ifa.ifa_prefixlen == 128) {
+			memset(&cinfo, 0, sizeof(cinfo));
+			cinfo.ifa_prefered = 0;
+			cinfo.ifa_valid = 0xFFFFFFFFU;
+
+			addr_str = ipaddresstos(ipaddress);
+			log_message(LOG_INFO, "%s has a prefix length of 128, setting "
+					      "preferred_lft to 0\n", addr_str);
+			FREE(addr_str);
+			addattr_l(&req.n, sizeof(req), IFA_CACHEINFO, &cinfo,
+				  sizeof(cinfo));
+		}
+
+		/* Disable, per VIP, Duplicate Address Detection algorithm (DAD).
+		 * Using the nodad flag has the following benefits:
+		 *
+		 * (1) The address becomes immediately usable after they're
+		 *     configured.
+		 * (2) In the case of a temporary layer-2 / split-brain problem
+		 *     we can avoid that the active VIP transitions into the
+		 *     dadfailed phase and stays there forever - leaving us
+		 *     without service. HA/VRRP setups have their own "DAD"-like
+		 *     functionality, so it's not really needed from the IPv6 stack.
+		 */
+		#ifdef IFA_F_NODAD
+			req.ifa.ifa_flags |= IFA_F_NODAD;
+		#endif
+
 		addattr_l(&req.n, sizeof(req), IFA_LOCAL,
 			  &ipaddress->u.sin6_addr, sizeof(ipaddress->u.sin6_addr));
 	} else {
 		addattr_l(&req.n, sizeof(req), IFA_LOCAL,
+			  &ipaddress->u.sin.sin_addr, sizeof(ipaddress->u.sin.sin_addr));
+		if (cmd == IPADDRESS_DEL)
+			addattr_l(&req.n, sizeof(req), IFA_ADDRESS,
 			  &ipaddress->u.sin.sin_addr, sizeof(ipaddress->u.sin.sin_addr));
 		if (ipaddress->u.sin.sin_brd.s_addr)
 			addattr_l(&req.n, sizeof(req), IFA_BROADCAST,
@@ -79,17 +116,97 @@ netlink_iplist(list ip_list, int cmd)
 		return;
 
 	/*
-	 * If "--dont-release-vrrp" (debug & 8) is set then try to release
-	 * addresses that may be there, even if we didn't set them.
+	 * If "--dont-release-vrrp" is set then try to release addresses
+	 * that may be there, even if we didn't set them.
 	 */
 	for (e = LIST_HEAD(ip_list); e; ELEMENT_NEXT(e)) {
 		ipaddr = ELEMENT_DATA(e);
 		if ((cmd && !ipaddr->set) ||
-		    (!cmd && (ipaddr->set || debug & 8))) {
+		    (!cmd &&
+		     (ipaddr->set || __test_bit(DONT_RELEASE_VRRP_BIT, &debug)))) {
 			if (netlink_ipaddress(ipaddr, cmd) > 0)
 				ipaddr->set = (cmd) ? 1 : 0;
 			else
 				ipaddr->set = 0;
+		}
+	}
+}
+
+static void
+handle_iptable_rule_to_NA(ip_address_t *ipaddress, int cmd, char *ifname)
+{
+	char  *argv[14];
+	unsigned int i = 0;
+
+	argv[i++] = "ip6tables";
+	argv[i++] = cmd ? "-A" : "-D";
+	argv[i++] = "INPUT";
+	argv[i++] = "-i";
+	argv[i++] = ifname;
+	argv[i++] = "-d";
+	argv[i++] = ipaddresstos(ipaddress);
+	argv[i++] = "-p";
+	argv[i++] = "icmpv6";
+	argv[i++] = "--icmpv6-type";
+	argv[i++] = "136";
+	argv[i++] = "-j";
+	argv[i++] = "ACCEPT";
+	argv[i] = '\0';
+
+	if (fork_exec(argv) < 0)
+		log_message(LOG_ERR, "Failed to %s ip6table rule to accept NAs sent"
+				     "to vip %s\n", (cmd) ? "set" : "remove",
+				     ipaddresstos(ipaddress));
+}
+
+/* add/remove iptable drop rule to VIP */
+static void
+handle_iptable_rule_to_vip(ip_address_t *ipaddress, int cmd, char *ifname)
+{
+	char  *argv[10];
+	unsigned int i = 0;
+
+	if (IP_IS6(ipaddress)) {
+		handle_iptable_rule_to_NA(ipaddress, cmd, ifname);
+		argv[i++] = "ip6tables";
+	} else {
+		argv[i++] = "iptables";
+	}
+
+	argv[i++] = cmd ? "-A" : "-D";
+	argv[i++] = "INPUT";
+	argv[i++] = "-i";
+	argv[i++] = ifname;
+	argv[i++] = "-d";
+	argv[i++] = ipaddresstos(ipaddress);
+	argv[i++] = "-j";
+	argv[i++] = "DROP";
+	argv[i] = '\0';
+
+	if (fork_exec(argv) < 0)
+		log_message(LOG_ERR, "Failed to %s iptable drop rule"
+				     " to vip %s\n", (cmd) ? "set" : "remove",
+				     ipaddresstos(ipaddress));
+	else
+		ipaddress->iptable_rule_set = (cmd) ? true : false;
+}
+
+/* add/remove iptable drop rules to iplist */
+void
+handle_iptable_rule_to_iplist(list ip_list, int cmd, char *ifname)
+{
+	ip_address_t *ipaddr;
+	element e;
+
+	/* No addresses in this list */
+	if (LIST_ISEMPTY(ip_list))
+		return;
+
+	for (e = LIST_HEAD(ip_list); e; ELEMENT_NEXT(e)) {
+		ipaddr = ELEMENT_DATA(e);
+		if ((cmd && !ipaddr->iptable_rule_set) ||
+		    (!cmd && ipaddr->iptable_rule_set)) {
+			handle_iptable_rule_to_vip(ipaddr, cmd, ifname);
 		}
 	}
 }
@@ -152,16 +269,24 @@ parse_ipaddress(ip_address_t *ip_address, char *str)
 		new = (ip_address_t *) MALLOC(sizeof(ip_address_t));
 	}
 
+	/* Handle the specials */
+	if (!strcmp(str, "default")) {
+		new->ifa.ifa_family = AF_INET;
+		return new;
+	} else if (!strcmp(str, "default6")) {
+		new->ifa.ifa_family = AF_INET6;
+		return new;
+	}
+
 	/* Parse ip address */
+	new->ifa.ifa_family = (strchr(str, ':')) ? AF_INET6 : AF_INET;
+	new->ifa.ifa_prefixlen = (IP_IS6(new)) ? 128 : 32;
 	p = strchr(str, '/');
 	if (p) {
 		new->ifa.ifa_prefixlen = atoi(p + 1);
 		*p = 0;
 	}
 
-	new->ifa.ifa_family = (strchr(str, ':')) ? AF_INET6 : AF_INET;
-	if (!new->ifa.ifa_prefixlen)
-		new->ifa.ifa_prefixlen = (IP_IS6(new)) ? 128 : 32;
 	addr = (IP_IS6(new)) ? (void *) &new->u.sin6_addr :
 			       (void *) &new->u.sin.sin_addr;
 	if (!inet_pton(IP_FAMILY(new), str, addr)) {
@@ -224,12 +349,12 @@ alloc_ipaddress(list ip_list, vector_t *strvec, interface_t *ifp)
 			if (IP_IS6(new)) {
 				log_message(LOG_INFO, "VRRP is trying to assign a broadcast %s to the IPv6 address %s !!?? "
 						      "WTF... skipping VIP..."
-						    , vector_slot(strvec, i), vector_slot(strvec, addr_idx));
+						    , FMT_STR_VSLOT(strvec, i), FMT_STR_VSLOT(strvec, addr_idx));
 				FREE(new);
 				return;
 			} else if (!inet_pton(AF_INET, vector_slot(strvec, ++i), &new->u.sin.sin_brd)) {
 				log_message(LOG_INFO, "VRRP is trying to assign invalid broadcast %s. "
-						      "skipping VIP...", vector_slot(strvec, i));
+						      "skipping VIP...", FMT_STR_VSLOT(strvec, i));
 				FREE(new);
 				return;
 			}
@@ -261,6 +386,7 @@ address_exist(list l, ip_address_t *ipaddress)
 		ipaddr = ELEMENT_DATA(e);
 		if (IP_ISEQ(ipaddr, ipaddress)) {
 			ipaddr->set = ipaddress->set;
+			ipaddr->iptable_rule_set = ipaddress->iptable_rule_set;
 			return 1;
 		}
 	}
@@ -276,15 +402,19 @@ clear_diff_address(list l, list n)
 	element e;
 	char *addr_str;
 	void *addr;
+	char *iface_name;
 
 	/* No addresses in previous conf */
 	if (LIST_ISEMPTY(l))
 		return;
 
+	ipaddr = ELEMENT_DATA(LIST_HEAD(l));
+	iface_name = IF_NAME(base_if_get_by_ifindex(ipaddr->ifa.ifa_index));
 	/* All addresses removed */
 	if (LIST_ISEMPTY(n)) {
 		log_message(LOG_INFO, "Removing a VIP|E-VIP block");
 		netlink_iplist(l, IPADDRESS_DEL);
+		handle_iptable_rule_to_iplist(l, IPADDRESS_DEL, iface_name);
 		return;
 	}
 
@@ -302,6 +432,8 @@ clear_diff_address(list l, list n)
 					    , ipaddr->ifa.ifa_prefixlen
 					    , IF_NAME(if_get_by_ifindex(ipaddr->ifa.ifa_index)));
 			netlink_ipaddress(ipaddr, IPADDRESS_DEL);
+			if (ipaddr->iptable_rule_set)
+				handle_iptable_rule_to_vip(ipaddr, IPADDRESS_DEL, iface_name);
 		}
 	}
 	FREE(addr_str);

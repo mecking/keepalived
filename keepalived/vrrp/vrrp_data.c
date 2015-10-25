@@ -24,10 +24,12 @@
 #include "vrrp_index.h"
 #include "vrrp_sync.h"
 #include "vrrp_if.h"
+#include "vrrp_vmac.h"
 #include "vrrp.h"
 #include "memory.h"
 #include "utils.h"
 #include "logger.h"
+#include "bitops.h"
 
 /* global vars */
 vrrp_data_t *vrrp_data = NULL;
@@ -115,8 +117,8 @@ dump_vscript(void *data)
 
 	log_message(LOG_INFO, " VRRP Script = %s", vscript->sname);
 	log_message(LOG_INFO, "   Command = %s", vscript->script);
-	log_message(LOG_INFO, "   Interval = %d sec", vscript->interval / TIMER_HZ);
-	log_message(LOG_INFO, "   Timeout = %d sec", vscript->timeout / TIMER_HZ);
+	log_message(LOG_INFO, "   Interval = %d sec", (int)(vscript->interval / TIMER_HZ));
+	log_message(LOG_INFO, "   Timeout = %d sec", (int)(vscript->timeout / TIMER_HZ));
 	log_message(LOG_INFO, "   Weight = %d", vscript->weight);
 	log_message(LOG_INFO, "   Rise = %d", vscript->rise);
 	log_message(LOG_INFO, "   Fall = %d", vscript->fall);
@@ -140,6 +142,11 @@ free_sock(void *sock_data)
 {
 	sock_t *sock = sock_data;
 	interface_t *ifp;
+
+	/* First of all cancel pending thread */
+	thread_cancel(sock->thread);
+
+	/* Close related socket */
 	if (sock->fd_in > 0) {
 		ifp = if_get_by_ifindex(sock->ifindex);
 		if (sock->unicast) {
@@ -193,6 +200,7 @@ free_vrrp(void *data)
 	FREE_PTR(vrrp->script_fault);
 	FREE_PTR(vrrp->script_stop);
 	FREE_PTR(vrrp->script);
+	FREE_PTR(vrrp->stats);
 	FREE(vrrp->ipsecah_counter);
 
 	if (!LIST_ISEMPTY(vrrp->track_ifp))
@@ -218,6 +226,7 @@ dump_vrrp(void *data)
 	char auth_data[sizeof(vrrp->auth_data) + 1];
 
 	log_message(LOG_INFO, " VRRP Instance = %s", vrrp->iname);
+	log_message(LOG_INFO, "   Using VRRPv%d", vrrp->version);
 	if (vrrp->family == AF_INET6)
 		log_message(LOG_INFO, "   Using Native IPv6");
 	if (vrrp->init_state == VRRP_STATE_BACK)
@@ -227,32 +236,44 @@ dump_vrrp(void *data)
 	log_message(LOG_INFO, "   Runing on device = %s", IF_NAME(vrrp->ifp));
 	if (vrrp->dont_track_primary)
 		log_message(LOG_INFO, "   VRRP interface tracking disabled");
-	if (vrrp->mcast_saddr)
-		log_message(LOG_INFO, "   Using mcast src_ip = %s",
-		       inet_ntop2(vrrp->mcast_saddr));
+	if (vrrp->saddr.ss_family)
+		log_message(LOG_INFO, "   Using src_ip = %s"
+				    , inet_sockaddrtos(&vrrp->saddr));
 	if (vrrp->lvs_syncd_if)
 		log_message(LOG_INFO, "   Runing LVS sync daemon on interface = %s",
 		       vrrp->lvs_syncd_if);
 	if (vrrp->garp_delay)
 		log_message(LOG_INFO, "   Gratuitous ARP delay = %d",
 		       vrrp->garp_delay/TIMER_HZ);
+	if (!timer_isnull(vrrp->garp_refresh))
+		log_message(LOG_INFO, "   Gratuitous ARP refresh timer = %lu",
+		       vrrp->garp_refresh.tv_sec);
+	log_message(LOG_INFO, "   Gratuitous ARP repeat = %d", vrrp->garp_rep);
+	log_message(LOG_INFO, "   Gratuitous ARP refresh repeat = %d", vrrp->garp_refresh_rep);
 	log_message(LOG_INFO, "   Virtual Router ID = %d", vrrp->vrid);
 	log_message(LOG_INFO, "   Priority = %d", vrrp->base_priority);
-	log_message(LOG_INFO, "   Advert interval = %dsec",
-	       vrrp->adver_int / TIMER_HZ);
+	log_message(LOG_INFO, "   Advert interval = %d %s\n",
+		(vrrp->version == VRRP_VERSION_2) ? (vrrp->adver_int / TIMER_HZ) :
+		(vrrp->adver_int * 1000 / TIMER_HZ),
+		(vrrp->version == VRRP_VERSION_2) ? "sec" : "milli-sec");
+	log_message(LOG_INFO, "   Accept %s", ((vrrp->accept) ? "enabled" : "disabled"));
 	if (vrrp->nopreempt)
 		log_message(LOG_INFO, "   Preempt disabled");
 	if (vrrp->preempt_delay)
 		log_message(LOG_INFO, "   Preempt delay = %ld secs",
 		       vrrp->preempt_delay / TIMER_HZ);
-	if (vrrp->auth_type) {
-		log_message(LOG_INFO, "   Authentication type = %s",
-		       (vrrp->auth_type ==
-			VRRP_AUTH_AH) ? "IPSEC_AH" : "SIMPLE_PASSWORD");
-		/* vrrp->auth_data is not \0 terminated */
-		memcpy(auth_data, vrrp->auth_data, sizeof(vrrp->auth_data));
-		auth_data[sizeof(vrrp->auth_data)] = '\0';
-		log_message(LOG_INFO, "   Password = %s", auth_data);
+	if (vrrp->version == VRRP_VERSION_2) {
+		if (vrrp->auth_type) {
+			log_message(LOG_INFO, "   Authentication type = %s",
+				    (vrrp->auth_type ==
+				     VRRP_AUTH_AH) ? "IPSEC_AH" : "SIMPLE_PASSWORD");
+			if (vrrp->auth_type != VRRP_AUTH_AH) {
+				/* vrrp->auth_data is not \0 terminated */
+				memcpy(auth_data, vrrp->auth_data, sizeof(vrrp->auth_data));
+				auth_data[sizeof(vrrp->auth_data)] = '\0';
+				log_message(LOG_INFO, "   Password = %s", auth_data);
+			}
+		}
 	}
 	if (!LIST_ISEMPTY(vrrp->track_ifp)) {
 		log_message(LOG_INFO, "   Tracked interfaces = %d", LIST_SIZE(vrrp->track_ifp));
@@ -279,22 +300,21 @@ dump_vrrp(void *data)
 		dump_list(vrrp->vroutes);
 	}
 	if (vrrp->script_backup)
-		log_message(LOG_INFO, "   Backup state transition script = %s",
-		       vrrp->script_backup);
+		log_message(LOG_INFO, "   Backup state transition script = %s", vrrp->script_backup);
 	if (vrrp->script_master)
-		log_message(LOG_INFO, "   Master state transition script = %s",
-		       vrrp->script_master);
+		log_message(LOG_INFO, "   Master state transition script = %s", vrrp->script_master);
 	if (vrrp->script_fault)
-		log_message(LOG_INFO, "   Fault state transition script = %s",
-		       vrrp->script_fault);
+		log_message(LOG_INFO, "   Fault state transition script = %s", vrrp->script_fault);
 	if (vrrp->script_stop)
-		log_message(LOG_INFO, "   Stop state transition script = %s",
-		       vrrp->script_stop);
+		log_message(LOG_INFO, "   Stop state transition script = %s", vrrp->script_stop);
 	if (vrrp->script)
-		log_message(LOG_INFO, "   Generic state transition script = '%s'",
-		       vrrp->script);
+		log_message(LOG_INFO, "   Generic state transition script = '%s'", vrrp->script);
 	if (vrrp->smtp_alert)
 		log_message(LOG_INFO, "   Using smtp notification");
+	if (__test_bit(VRRP_VMAC_BIT, &vrrp->vmac_flags))
+		log_message(LOG_INFO, "   Using VRRP VMAC (flags:%s|%s)"
+				    , (__test_bit(VRRP_VMAC_UP_BIT, &vrrp->vmac_flags)) ? "UP" : "DOWN"
+				    , (__test_bit(VRRP_VMAC_XMITBASE_BIT, &vrrp->vmac_flags)) ? "xmit_base" : "xmit");
 }
 
 void
@@ -331,13 +351,42 @@ alloc_vrrp(char *iname)
 	new->family = AF_INET;
 	new->wantstate = VRRP_STATE_BACK;
 	new->init_state = VRRP_STATE_BACK;
+	new->version = VRRP_VERSION_2;
+	new->master_priority = 0;
+	new->last_transition = timer_now();
 	new->adver_int = TIMER_HZ;
 	new->iname = (char *) MALLOC(size + 1);
+	new->stats = alloc_vrrp_stats();
 	memcpy(new->iname, iname, size);
 	new->quick_sync = 0;
+	new->garp_rep = VRRP_GARP_REP;
+	new->garp_refresh_rep = VRRP_GARP_REFRESH_REP;
 
 	list_add(vrrp_data->vrrp, new);
 }
+
+vrrp_stats *
+alloc_vrrp_stats(void)
+{
+    vrrp_stats *new;
+    new = (vrrp_stats *) MALLOC(sizeof (vrrp_stats));
+    new->become_master = 0;
+    new->release_master = 0;
+    new->invalid_authtype = 0;
+    new->authtype_mismatch = 0;
+    new->packet_len_err = 0;
+    new->advert_rcvd = 0;
+    new->advert_sent = 0;
+    new->advert_interval_err = 0;
+    new->auth_failure = 0;
+    new->ip_ttl_err = 0;
+    new->pri_zero_rcvd = 0;
+    new->pri_zero_sent = 0;
+    new->invalid_type_rcvd = 0;
+    new->addr_list_err = 0;
+    return new;
+}
+
 
 void
 alloc_vrrp_unicast_peer(vector_t *strvec)
@@ -353,8 +402,18 @@ alloc_vrrp_unicast_peer(vector_t *strvec)
 	peer = (struct sockaddr_storage *) MALLOC(sizeof(struct sockaddr_storage));
 	ret = inet_stosockaddr(vector_slot(strvec, 0), 0, peer);
 	if (ret < 0) {
-		log_message(LOG_ERR, "Configuration error: malformed unicast peer address"
-				     " [%s]. Skipping...");
+		log_message(LOG_ERR, "Configuration error: VRRP instance[%s] malformed unicast"
+				     " peer address[%s]. Skipping..."
+				   , vrrp->iname, FMT_STR_VSLOT(strvec, 0));
+		FREE(peer);
+		return;
+	}
+
+	if (peer->ss_family != vrrp->family) {
+		log_message(LOG_ERR, "Configuration error: VRRP instance[%s] and unicast peer address"
+				     "[%s] MUST be of the same family !!! Skipping..."
+				   , vrrp->iname, FMT_STR_VSLOT(strvec, 0));
+		FREE(peer);
 		return;
 	}
 
@@ -472,14 +531,7 @@ free_vrrp_data(vrrp_data_t * data)
 	free_list(data->vrrp);
 	free_list(data->vrrp_sync_group);
 	free_list(data->vrrp_script);
-//	free_list(data->vrrp_socket_pool);
 	FREE(data);
-}
-
-void
-free_vrrp_sockpool(vrrp_data_t * data)
-{
-	free_list(data->vrrp_socket_pool);
 }
 
 void

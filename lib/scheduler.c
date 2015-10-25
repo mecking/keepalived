@@ -392,9 +392,12 @@ thread_add_terminate_event(thread_master_t * m)
 }
 
 /* Cancel thread from scheduler. */
-void
+int
 thread_cancel(thread_t * thread)
 {
+	if (!thread)
+		return -1;
+
 	switch (thread->type) {
 	case THREAD_READ:
 		assert(FD_ISSET(thread->u.fd, &thread->master->readfd));
@@ -429,6 +432,7 @@ thread_cancel(thread_t * thread)
 
 	thread->type = THREAD_UNUSED;
 	thread_add_unuse(thread->master, thread);
+	return 0;
 }
 
 /* Delete all events which has argument value arg. */
@@ -614,7 +618,8 @@ retry:	/* When thread can't fetch try to find next thread again. */
 			thread_list_delete(&m->child, t);
 			thread_list_add(&m->ready, t);
 			t->type = THREAD_CHILD_TIMEOUT;
-		}
+		} else
+			break;
 	}
 
 	/* Read thead. */
@@ -679,7 +684,8 @@ retry:	/* When thread can't fetch try to find next thread again. */
 			thread_list_delete(&m->timer, t);
 			thread_list_add(&m->ready, t);
 			t->type = THREAD_READY;
-		}
+		} else
+			break;
 	}
 
 	/* Return one event. */

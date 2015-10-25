@@ -20,10 +20,14 @@
  * Copyright (C) 2001-2012 Alexandre Cassen, <acassen@linux-vs.org>
  */
 
+#include <sys/wait.h>
+#include "memory.h"
+#include <unistd.h>
+#include <fcntl.h>
 #include "utils.h"
 
 /* global vars */
-int debug = 0;
+unsigned long debug = 0;
 
 /* Display a buffer into a HEXA formated output */
 void
@@ -70,7 +74,7 @@ dump_buffer(char *buff, int count)
 
 /* Compute a checksum */
 u_short
-in_csum(u_short * addr, int len, u_short csum)
+in_csum(u_short *addr, int len, int csum, int *acc)
 {
 	register int nleft = len;
 	const u_short *w = addr;
@@ -91,6 +95,9 @@ in_csum(u_short * addr, int len, u_short csum)
 	/* mop up an odd byte, if necessary */
 	if (nleft == 1)
 		sum += htons(*(u_char *) w << 8);
+
+	if (acc)
+		*acc = sum;
 
 	/*
 	 * add back carry outs from top 16 bits to low 16 bits
@@ -158,6 +165,34 @@ inet_stor(char *addr)
 	return 0;
 }
 
+/* Domain to sockaddr_storage */
+int
+domain_stosockaddr(char *domain, char *port, struct sockaddr_storage *addr)
+{
+	struct addrinfo *res = NULL;
+
+	if (getaddrinfo(domain, NULL, NULL, &res) != 0 || !res)
+		return -1;
+
+	addr->ss_family = res->ai_family;
+
+	if (addr->ss_family == AF_INET6) {
+		struct sockaddr_in6 *addr6 = (struct sockaddr_in6 *) addr;
+		*addr6 = *(struct sockaddr_in6 *) res->ai_addr;
+		if (port)
+			addr6->sin6_port = htons(atoi(port));
+	} else {
+		struct sockaddr_in *addr4 = (struct sockaddr_in *) addr;
+		*addr4 = *(struct sockaddr_in *) res->ai_addr;
+		if (port)
+			addr4->sin_port = htons(atoi(port));
+	}
+
+	freeaddrinfo(res);
+
+	return 0;
+}
+
 /* IP string to sockaddr_storage */
 int
 inet_stosockaddr(char *ip, char *port, struct sockaddr_storage *addr)
@@ -195,6 +230,34 @@ inet_stosockaddr(char *ip, char *port, struct sockaddr_storage *addr)
 	if (!inet_pton(addr->ss_family, ip, addr_ip))
 		return -1;
 
+	return 0;
+}
+
+/* IPv4 to sockaddr_storage */
+int
+inet_ip4tosockaddr(struct in_addr *sin_addr, struct sockaddr_storage *addr)
+{
+	struct sockaddr_in *addr4 = (struct sockaddr_in *) addr;
+	addr4->sin_family = AF_INET;
+	addr4->sin_addr = *sin_addr;
+	return 0;
+}
+
+/* IPv6 to sockaddr_storage */
+int
+inet_ip6tosockaddr(struct in6_addr *sin_addr, struct sockaddr_storage *addr)
+{
+	struct sockaddr_in6 *addr6 = (struct sockaddr_in6 *) addr;
+	addr6->sin6_family = AF_INET6;
+	addr6->sin6_addr = *sin_addr;
+	return 0;
+}
+
+int
+inet_ip6scopeid(uint32_t scope_id, struct sockaddr_storage *addr)
+{
+	struct sockaddr_in6 *addr6 = (struct sockaddr_in6 *) addr;
+	addr6->sin6_scope_id = scope_id;
 	return 0;
 }
 
@@ -242,6 +305,19 @@ inet_sockaddrport(struct sockaddr_storage *addr)
 	return port;
 }
 
+char *
+inet_sockaddrtopair(struct sockaddr_storage *addr)
+{
+	static char addr_str[INET6_ADDRSTRLEN + 1];
+	static char ret[sizeof(addr_str) + 16];
+
+	inet_sockaddrtos2(addr, addr_str);
+	snprintf(ret, sizeof(ret) - 1, "[%s]:%d"
+		, addr_str
+		, ntohs(inet_sockaddrport(addr)));
+	return ret;
+}
+
 uint32_t
 inet_sockaddrip4(struct sockaddr_storage *addr)
 {
@@ -258,6 +334,72 @@ inet_sockaddrip6(struct sockaddr_storage *addr, struct in6_addr *ip6)
 		return -1;
 	
 	*ip6 = ((struct sockaddr_in6 *) addr)->sin6_addr;
+	return 0;
+}
+
+/* IPv6 address compare */
+int
+inet_inaddrcmp(int family, void *a, void *b)
+{
+	if (family == AF_INET) {
+		if (ntohl(*((const uint32_t *) a)) >
+		    ntohl(*((const uint32_t *) b)))
+			return 1;
+		if (ntohl(*((const uint32_t *) a)) <
+		    ntohl(*((const uint32_t *) b)))
+			return -1;
+		return 0;
+	}
+
+	if (family == AF_INET6) {
+		if (ntohl(((const uint32_t *) (a))[0]) >
+		    ntohl(((const uint32_t *) (b))[0]))
+			return 1;
+		if (ntohl(((const uint32_t *) (a))[0]) <
+		    ntohl(((const uint32_t *) (b))[0]))
+			return -1;
+
+		if (ntohl(((const uint32_t *) (a))[1]) >
+		    ntohl(((const uint32_t *) (b))[1]))
+			return 1;
+		if (ntohl(((const uint32_t *) (a))[1]) <
+		    ntohl(((const uint32_t *) (b))[1]))
+			return -1;
+
+		if (ntohl(((const uint32_t *) (a))[2]) >
+		    ntohl(((const uint32_t *) (b))[2]))
+			return 1;
+		if (ntohl(((const uint32_t *) (a))[2]) <
+		    ntohl(((const uint32_t *) (b))[2]))
+			return -1;
+
+		if (ntohl(((const uint32_t *) (a))[3]) >
+		    ntohl(((const uint32_t *) (b))[3]))
+			return 1;
+		if (ntohl(((const uint32_t *) (a))[3]) <
+		    ntohl(((const uint32_t *) (b))[3]))
+			return -1;
+
+		return 0;
+	}
+
+	return -2;
+}
+
+int
+inet_sockaddrcmp(struct sockaddr_storage *a, struct sockaddr_storage *b)
+{
+	if (a->ss_family != b->ss_family)
+		return -2;
+
+	if (a->ss_family == AF_INET)
+		return inet_inaddrcmp(a->ss_family,
+				      &((struct sockaddr_in *) a)->sin_addr,
+				      &((struct sockaddr_in *) b)->sin_addr);
+	if (a->ss_family == AF_INET6)
+		return inet_inaddrcmp(a->ss_family,
+				      &((struct sockaddr_in6 *) a)->sin6_addr,
+				      &((struct sockaddr_in6 *) b)->sin6_addr);
 	return 0;
 }
 
@@ -332,14 +474,79 @@ inet_cidrtomask(uint8_t cidr)
 char *
 get_local_name(void)
 {
-	struct hostent *host;
 	struct utsname name;
+	struct addrinfo hints, *res = NULL;
+	char *canonname = NULL;
+	int len = 0;
+
+	memset(&hints, 0, sizeof(struct addrinfo));
+	hints.ai_flags = AI_CANONNAME;
 
 	if (uname(&name) < 0)
 		return NULL;
 
-	if (!(host = gethostbyname(name.nodename)))
+	if (getaddrinfo(name.nodename, NULL, &hints, &res) != 0)
 		return NULL;
 
-	return host->h_name;
+	if (res && res->ai_canonname) {
+		len = strlen(res->ai_canonname);
+		canonname = MALLOC(len + 1);
+		if (canonname) {
+			memcpy(canonname, res->ai_canonname, len);
+		}
+	}
+
+	freeaddrinfo(res);
+
+	return canonname;
+}
+
+/* String compare with NULL string handling */
+int
+string_equal(const char *str1, const char *str2)
+{
+	if (!str1 && !str2)
+		return 1;
+	if ((!str1 && str2) || (str1 && !str2))
+		return 0;
+	for (; *str1 == *str2; str1++, str2++) {
+		if (*str1 == 0 || *str2 == 0)
+			break;
+	}
+
+	return (*str1 == 0 && *str2 == 0);
+}
+
+int
+fork_exec(char **argv)
+{
+	pid_t pid;
+	int fd;
+	int status;
+
+	pid = fork();
+	if (pid < 0)
+		return -1;
+
+	/* Child */
+	if (pid == 0) {
+		fd = open("/dev/null", O_RDWR, 0);
+		if (fd != -1) {
+			dup2(fd, STDIN_FILENO);
+			dup2(fd, STDOUT_FILENO);
+			dup2(fd, STDERR_FILENO);
+			if (fd > 2)
+				close(fd);
+		}
+		execvp(*argv, argv);
+		exit(EXIT_FAILURE);
+	} else {
+		/* Parent */
+		while (waitpid(pid, &status, 0) != pid);
+
+		if (WEXITSTATUS(status) != EXIT_SUCCESS)
+			return -1;
+	}
+
+	return 0;
 }

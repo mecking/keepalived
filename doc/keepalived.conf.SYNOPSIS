@@ -22,16 +22,18 @@ This block is divided in 2 sub-block :
 	The configuration block looks like :
 
 global_defs {				# Block identification
-    notification_email {		# Email to send alertes to
+    notification_email {		# Email address to send alerts to
        <EMAIL ADDRESS>			# Standard email address
-      <EMAIL ADDRESS>
-      ...
+       <EMAIL ADDRESS>
+       ...
     }
     notification_email_from <EMAIL ADDRESS> # Email From dealing with SMTP proto
-    smtp_server <IP ADDRESS>		   # SMTP server IP address
+    smtp_server <ADDRESS>		   # SMTP server IP address or damain name
     smtp_connect_timeout <INTEGER>	   # Number of seconds timeout connect
  					   #  remote SMTP server
     router_id <STRING>			   # String identifying router
+    vrrp_mcast_group4 <IPv4 ADDRESS>	   # optional, default 224.0.0.18
+    vrrp_mcast_group6 <IPv6 ADDRESS>	   # optional, default ff02::12
 }
 
 linkbeat_use_polling	# Use media link failure detection polling fashion
@@ -87,6 +89,7 @@ This block is divided in 3 sub-block :
 vrrp_script <STRING> {          # VRRP script declaration
     script <QUOTED_STRING>      # script to run periodically
     interval <INTEGER>          # run the script this every seconds
+    timeout <INTEGER>           # script considered failed after 'timeout' seconds
     weight <INTEGER:-254..254>  # adjust priority by this weight
     fall <INTEGER>              # required number of failures for KO switch
     rise <INTEGER>              # required number of successes for OK switch
@@ -117,7 +120,7 @@ vrrp_sync_group <STRING> {	# VRRP sync group declaration
     notify_backup <STRING>|<QUOTED-STRING> # Script to run during BACKUP transit
     notify_fault <STRING>|<QUOTED-STRING>  # Script to run during FAULT transit
     notify <STRING>|<QUOTED-STRING>	   # Script to run during ANY state transit (1)
-    smtp_alert		 # Send email notif during state transit
+    smtp_alert		 # Send email notification during state transit
 }
 
 (1) The "notify" script is called AFTER the corresponding notify_* script has
@@ -146,6 +149,8 @@ Important: for a SYNC group to run reliably, it is vital that all instances in
 
 vrrp_instance <STRING> {		# VRRP instance declaration
     use_vmac				# Use VRRP Virtual MAC
+    vmac_xmit_base			# Send/Recv VRRP messages from base
+					#  interface instead of VMAC interface
     native_ipv6				# Force instance to use IPv6
 					#  when using mixed IPv4&IPv6 conf
     state MASTER|BACKUP			# Start-up default state
@@ -164,6 +169,7 @@ vrrp_instance <STRING> {		# VRRP instance declaration
     dont_track_primary                  # (default unset) ignore VRRP interface faults.
                                         #  useful for cross-connect VRRP config.
     mcast_src_ip <IP ADDRESS>		# src_ip to use into the VRRP packets
+    unicast_src_ip <IP ADDRESS>		# src_ip to use into the VRRP packets (alias to mcast_src_ip)
     unicast_peer {			# Do not use multicast, instead send VRRP
       <IP ADDRESS>			#  adverts to following list of ip address
       ...				#  in unicast design fashion
@@ -171,11 +177,18 @@ vrrp_instance <STRING> {		# VRRP instance declaration
     lvs_sync_daemon_interface <STRING>	# Binding interface for lvs syncd
     garp_master_delay <INTEGER>		# delay for gratuitous ARP after MASTER
 					#  state transition
+    garp_master_repeat <INTEGER>        # how often the gratuitous ARP after MASTER
+                                        #  state transition should be repeated?
+    garp_master_refresh <INTEGER>	# Periodic delay in seconds sending
+					#  gratuitous ARP while in MASTER state
+    garp_master_refresh_repeat <INTEGER># how often the periodically repeated gratuitous ARP
+                                        #  should be repeated?
+                                        #  Default: once (per period)
     virtual_router_id <INTEGER-0..255>	# VRRP VRID
     priority <INTEGER-0..255>		# VRRP PRIO
     advert_int <INTEGER>		# VRRP Advert interval (use default)
     authentication {			# Authentication block
-        auth_type PASS|AH		# Simple Passwd or IPSEC AH
+        auth_type PASS|AH		# Simple password or IPSEC AH
         auth_pass <STRING>		# Password string (up to 8 characters)
     }
     virtual_ipaddress {			# VRRP IP addres block
@@ -245,7 +258,7 @@ This block is divided in 2 sub-block :
 	* Virtual server
 
 	3.1. Virtual server group
-	
+
 	The configuration block looks like :
 
 virtual_server_group <STRING> {
@@ -265,7 +278,7 @@ Note:	<IP ADDRESS RANGE> has the form of : XXX.YYY.ZZZ.WWW-VVV, define
 	one to VVV. Example : 192.168.200.1-10 means .1 to .10 IP addresses.
 
 	3.2. Virtual server
-	
+
 	The configuration block looks like :
 
 	A virtual_server can be either :
@@ -317,6 +330,9 @@ virtual_server group <STRING>      {	# VS group declaration
 
     sorry_server <IP ADDRESS> <PORT>	# RS to add to LVS topology when all
 					#   realserver are down
+    sorry_server_inhibit		# applies inhibit_on_failure behaviour
+					# to the preceding sorry_server
+					# directive
 
     real_server <IP ADDRESS> <PORT> {	# RS declaration
         weight <INTEGER>		# weight to use (default: 1)
@@ -325,10 +341,10 @@ virtual_server group <STRING>      {	# VS group declaration
         notify_up <STRING>|<QUOTED-STRING> # Script to launch when
 					   #  healthchecker consider service
 					   #  as up.
-        notify_down <STRING>|<QUOTED-STRING> # Script to launch when 
+        notify_down <STRING>|<QUOTED-STRING> # Script to launch when
 					     #  healthchecker consider service
 					     #  as down.
-	
+
         HTTP_GET|SSL_GET {		# HTTP and SSL healthcheckers
             url {			# A set of url to test
               path <STRING>		# Path
@@ -341,11 +357,15 @@ virtual_server group <STRING>      {	# VS group declaration
               status_code <INTEGER>
             }
             ...
-            connect_port <PORT>		# TCP port to connect
-            bindto <IP ADDRESS>		# IP address to bind to
-            connect_timeout <INTEGER>	# Timeout connection
-            nb_get_retry <INTEGER>	# number of get retry
+            connect_ip <IP ADDRESS> # IP address to connect
+            connect_port <PORT>     # TCP port to connect
+            bindto <IP ADDRESS>     # IP address to bind to
+            bind_port <PORT>        # TCP port to bind to
+            connect_timeout <INTEGER>   # Timeout connection
+            fwmark <INTEGER>        # fwmark to set on socket (SO_MARK)
+            nb_get_retry <INTEGER>  # number of get retry
             delay_before_retry <INTEGER> # delay before retry
+            warmup <INTEGER>        # random delay for maximum N seconds
         }
     }
 
@@ -356,9 +376,13 @@ virtual_server group <STRING>      {	# VS group declaration
         notify_down <STRING>|<QUOTED-STRING> # Idem
 
         TCP_CHECK {			# TCP healthchecker
-            connect_port <PORT>		# TCP port to connect
-            bindto <IP ADDRESS>		# IP address to bind to
-            connect_timeout <INTEGER>	# Timeout connection
+            connect_ip <IP ADDRESS> # IP address to connect
+            connect_port <PORT>     # TCP port to connect
+            bindto <IP ADDRESS>     # IP address to bind to
+            bind_port <PORT>        # TCP port to bind to
+            connect_timeout <INTEGER>   # Timeout connection
+            fwmark <INTEGER>        # fwmark to set on socket (SO_MARK)
+            warmup <INTEGER>        # random delay for maximum N seconds
         }
     }
 
@@ -369,19 +393,31 @@ virtual_server group <STRING>      {	# VS group declaration
         notify_down <STRING>|<QUOTED-STRING> # Idem
 
         SMTP_CHECK {                   # SMTP healthchecker
+            connect_ip <IP ADDRESS>     # Optional IP address to connect to
+            connect_port <PORT>         # Optional port to connect to
+            bindto <IP ADDRESS>         # Optional interface to use to originate the connection
+            bind_port <PORT>            # Optional source port to originate the connection from
+            connect_timeout <INTEGER>   # Optional per-host connection timeout.
+            fwmark <INTEGER>            # Optional fwmark to mark all outgoing checker pakets with
             host {                      # Optional additional host/port to check
-                connect_ip <IP ADDRESS> # IP address to connect to
-                connect_port <PORT>     # Port to connect to
+                connect_ip <IP ADDRESS> # IP address to connect
+                connect_port <PORT>     # TCP port to connect
                 bindto <IP ADDRESS>     # IP address to bind to
-
+                bind_port <PORT>        # TCP port to bind to
+                connect_timeout <INTEGER>   # Timeout connection
+                fwmark <INTEGER>        # fwmark to set on socket (SO_MARK)
             }
             host {
-                connect_ip <IP ADDRESS>
-                connect_port <PORT>
-                bindto <IP ADDRESS>
+                connect_ip <IP ADDRESS> # IP address to connect
+                connect_port <PORT>     # TCP port to connect
+                bindto <IP ADDRESS>     # IP address to bind to
+                bind_port <PORT>        # TCP port to bind to
+                connect_timeout <INTEGER>   # Timeout connection
+                fwmark <INTEGER>        # fwmark to set on socket (SO_MARK)
             }
             ...
             connect_timeout <INTEGER>  # Connection and read/write timeout
+            warmup <INTEGER>        # random delay for maximum N seconds
             retry <INTEGER>             # Number of times to retry a failed check
             delay_before_retry <INTEGER> # Delay in seconds before retrying
             helo_name <STRING>|<QUOTED-STRING> # Host to use for the HELO request
@@ -397,6 +433,7 @@ virtual_server group <STRING>      {	# VS group declaration
         MISC_CHECK {				# MISC healthchecker
             misc_path <STRING>|<QUOTED-STRING>	# External system script or program
             misc_timeout <INTEGER>		# Script execution timeout
+            warmup <INTEGER>        # random delay for maximum N seconds
 
             # If set, exit code from healthchecker is used
             # to dynamically adjust the weight as follows:

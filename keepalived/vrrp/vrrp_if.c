@@ -23,11 +23,11 @@
 /* global include */
 #include <unistd.h>
 #include <string.h>
-#include <sys/types.h>
-typedef __uint64_t u64;
-typedef __uint32_t u32;
-typedef __uint16_t u16;
-typedef __uint8_t u8;
+#include <stdint.h>
+typedef uint64_t u64;
+typedef uint32_t u32;
+typedef uint16_t u16;
+typedef uint8_t u8;
 #include <sys/socket.h>
 #include <sys/ioctl.h>
 #include <netinet/in.h>
@@ -79,23 +79,13 @@ if_get_by_ifindex(const int ifindex)
 	return NULL;
 }
 
-/* Return interface from VMAC base interface index */
+/* Return base interface from interface index incase of VMAC */
 interface_t *
-if_get_by_vmac_base_ifindex(const int ifindex)
+base_if_get_by_ifindex(const int ifindex)
 {
-	interface_t *ifp;
-	element e;
+	interface_t *ifp = if_get_by_ifindex(ifindex);
 
-	if (LIST_ISEMPTY(if_queue) || !ifindex)
-		return NULL;
-
-	for (e = LIST_HEAD(if_queue); e; ELEMENT_NEXT(e)) {
-		ifp = ELEMENT_DATA(e);
-		if (ifp->vmac && ifp->base_ifindex == ifindex)
-			return ifp;
-	}
-
-	return NULL;
+	return (ifp && ifp->vmac) ? if_get_by_ifindex(ifp->base_ifindex) : ifp;
 }
 
 interface_t *
@@ -113,6 +103,27 @@ if_get_by_ifname(const char *ifname)
 			return ifp;
 	}
 	return NULL;
+}
+
+/*
+ * Reflect base interface flags on VMAC interfaces.
+ * VMAC interfaces should never update it own flags, only be reflected
+ * by the base interface flags.
+ */
+void
+if_vmac_reflect_flags(const int ifindex, const unsigned long flags)
+{
+	interface_t *ifp;
+	element e;
+
+	if (LIST_ISEMPTY(if_queue) || !ifindex)
+		return;
+
+	for (e = LIST_HEAD(if_queue); e; ELEMENT_NEXT(e)) {
+		ifp = ELEMENT_DATA(e);
+		if (ifp->vmac && ifp->base_ifindex == ifindex)
+			ifp->flags = flags;
+	}
 }
 
 /* MII Transceiver Registers poller functions */
@@ -408,15 +419,14 @@ free_interface_queue(void)
 	if (!LIST_ISEMPTY(if_queue))
 		free_list(if_queue);
 	if_queue = NULL;
-	kernel_netlink_close();
 }
 
 void
 init_interface_queue(void)
 {
 	init_if_queue();
-//	dump_list(if_queue);
 	netlink_interface_lookup();
+//	dump_list(if_queue);
 }
 
 void
@@ -448,7 +458,7 @@ if_join_vrrp_group(sa_family_t family, int *sd, interface_t *ifp, int proto)
 
 	if (family == AF_INET) {
 		memset(&imr, 0, sizeof(imr));
-		imr.imr_multiaddr.s_addr = htonl(INADDR_VRRP_GROUP);
+		imr.imr_multiaddr = ((struct sockaddr_in *) &global_data->vrrp_mcast_group4)->sin_addr;
 		imr.imr_address.s_addr = IF_ADDR(ifp);
 		imr.imr_ifindex = IF_INDEX(ifp);
 
@@ -459,8 +469,7 @@ if_join_vrrp_group(sa_family_t family, int *sd, interface_t *ifp, int proto)
 				 (char *) &imr, sizeof(struct ip_mreqn));
 	} else {
 		memset(&imr6, 0, sizeof(imr6));
-		imr6.ipv6mr_multiaddr.s6_addr16[0] = htons(0xff02);
-		imr6.ipv6mr_multiaddr.s6_addr16[7] = htons(0x12);
+		imr6.ipv6mr_multiaddr = ((struct sockaddr_in6 *) &global_data->vrrp_mcast_group6)->sin6_addr;
 		imr6.ipv6mr_interface = IF_INDEX(ifp);
 		ret = setsockopt(*sd, IPPROTO_IPV6, IPV6_ADD_MEMBERSHIP,
 				 (char *) &imr6, sizeof(struct ipv6_mreq));
@@ -479,7 +488,7 @@ if_join_vrrp_group(sa_family_t family, int *sd, interface_t *ifp, int proto)
 int
 if_leave_vrrp_group(sa_family_t family, int sd, interface_t *ifp)
 {
-	struct ip_mreqn imr;
+	struct ip_mreq imr;
 	struct ipv6_mreq imr6;
 	int ret = 0;
 
@@ -490,19 +499,13 @@ if_leave_vrrp_group(sa_family_t family, int sd, interface_t *ifp)
 	/* Leaving the VRRP multicast group */
 	if (family == AF_INET) {
 		memset(&imr, 0, sizeof(imr));
-		/* FIXME: change this to use struct ip_mreq */
-		imr.imr_multiaddr.s_addr = htonl(INADDR_VRRP_GROUP);
-		imr.imr_address.s_addr = IF_ADDR(ifp);
-		imr.imr_ifindex = IF_INDEX(ifp);
+		imr.imr_multiaddr = ((struct sockaddr_in *) &global_data->vrrp_mcast_group4)->sin_addr;
+		imr.imr_interface.s_addr = IF_ADDR(ifp);
 		ret = setsockopt(sd, IPPROTO_IP, IP_DROP_MEMBERSHIP,
-				 (char *) &imr, sizeof (struct ip_mreqn));
+				 (char *) &imr, sizeof(struct ip_mreq));
 	} else {
 		memset(&imr6, 0, sizeof(imr6));
-		/* rfc5798.5.1.2.2 : destination IPv6 mcast group is
-		 * ff02:0:0:0:0:0:0:12.
-		 */
-		imr6.ipv6mr_multiaddr.s6_addr16[0] = htons(0xff02);
-		imr6.ipv6mr_multiaddr.s6_addr16[7] = htons(0x12);
+		imr6.ipv6mr_multiaddr = ((struct sockaddr_in6 *) &global_data->vrrp_mcast_group6)->sin6_addr;
 		imr6.ipv6mr_interface = IF_INDEX(ifp);
 		ret = setsockopt(sd, IPPROTO_IPV6, IPV6_DROP_MEMBERSHIP,
 				 (char *) &imr6, sizeof(struct ipv6_mreq));
@@ -569,6 +572,26 @@ if_setsockopt_hdrincl(int *sd)
 }
 
 int
+if_setsockopt_ipv6_checksum(int *sd)
+{
+	int ret;
+	int offset = 6;
+
+	if (!sd && *sd < 0)
+		return -1;
+
+	ret = setsockopt(*sd, IPPROTO_IPV6, IPV6_CHECKSUM, &offset, sizeof(offset));
+	if (ret < 0) {
+		log_message(LOG_INFO, "cant set IPV6_CHECKSUM IP option. errno=%d (%m)", errno);
+		close(*sd);
+		*sd = -1;
+	}
+
+	return *sd;
+}
+
+
+int
 if_setsockopt_mcast_loop(sa_family_t family, int *sd)
 {
 	int ret;
@@ -578,7 +601,7 @@ if_setsockopt_mcast_loop(sa_family_t family, int *sd)
 	if (*sd < 0)
 		return -1;
 
-	/* Include IP header into RAW protocol packet */
+	/* Set Multicast loop */
 	if (family == AF_INET)
 		ret = setsockopt(*sd, IPPROTO_IP, IP_MULTICAST_LOOP, &loop, sizeof(loop));
 	else
@@ -604,7 +627,7 @@ if_setsockopt_mcast_hops(sa_family_t family, int *sd)
 	if (*sd < 0 || family == AF_INET)
 		return -1;
 
-	/* Include IP header into RAW protocol packet */
+	/* Set HOP limit */
 	ret = setsockopt(*sd, IPPROTO_IPV6, IPV6_MULTICAST_HOPS, &hops, sizeof(hops));
 	if (ret < 0) {
 		log_message(LOG_INFO, "cant set IPV6_MULTICAST_HOPS IP option. errno=%d (%m)", errno);
@@ -625,7 +648,7 @@ if_setsockopt_mcast_if(sa_family_t family, int *sd, interface_t *ifp)
 	if (*sd < 0 || family == AF_INET)
 		return -1;
 
-	/* Include IP header into RAW protocol packet */
+	/* Set interface for sending outbound datagrams */
 	ifindex = IF_INDEX(ifp);
 	ret = setsockopt(*sd, IPPROTO_IPV6, IPV6_MULTICAST_IF, &ifindex, sizeof(ifindex));
 	if (ret < 0) {
@@ -637,7 +660,9 @@ if_setsockopt_mcast_if(sa_family_t family, int *sd, interface_t *ifp)
 	return *sd;
 }
 
-int if_setsockopt_priority(int *sd) {
+int
+if_setsockopt_priority(int *sd)
+{
 	int ret;
 	int priority = 6;
 
@@ -648,6 +673,44 @@ int if_setsockopt_priority(int *sd) {
 	ret = setsockopt(*sd, SOL_SOCKET, SO_PRIORITY, &priority, sizeof(priority));
 	if (ret < 0) {
 		log_message(LOG_INFO, "cant set SO_PRIORITY IP option. errno=%d (%m)", errno);
+		close(*sd);
+		*sd = -1;
+	}
+
+	return *sd;
+}
+
+int
+if_setsockopt_sndbuf(int *sd, int val)
+{
+	int ret;
+
+	if (*sd < 0)
+		return -1;
+
+	/* sndbuf option */
+        ret = setsockopt(*sd, SOL_SOCKET, SO_SNDBUF, &val, sizeof(val));
+        if (ret < 0) {
+		log_message(LOG_INFO, "cant set SO_SNDBUF IP option. errno=%d (%m)", errno);
+		close(*sd);
+		*sd = -1;
+        }
+
+        return *sd;
+}
+
+int
+if_setsockopt_rcvbuf(int *sd, int val)
+{
+	int ret;
+
+	if (*sd < 0)
+		return -1;
+
+	/* rcvbuf option */
+	ret = setsockopt(*sd, SOL_SOCKET, SO_RCVBUF, &val, sizeof(val));
+	if (ret < 0) {
+		log_message(LOG_INFO, "cant set SO_RCVBUF IP option. errno=%d (%m)", errno);
 		close(*sd);
 		*sd = -1;
 	}

@@ -476,7 +476,7 @@ check_snmp_realserver_weight(int action,
 		if (action == RESERVE2)
 			break;
 		/* Commit: change values. There is no way to fail. */
-		update_svr_wgt((long)(*var_val), vs, rs);
+		update_svr_wgt((long)(*var_val), vs, rs, 1);
 		break;
 	}
 	return SNMP_ERR_NOERROR;
@@ -872,12 +872,13 @@ static struct variable8 check_vars[] = {
 };
 
 void
-check_snmp_agent_init()
+check_snmp_agent_init(const char *snmp_socket)
 {
-	snmp_agent_init(check_oid, OID_LENGTH(check_oid), "Healthchecker",
-			(struct variable *)check_vars,
-			sizeof(struct variable8),
-			sizeof(check_vars)/sizeof(struct variable8));
+	snmp_agent_init(snmp_socket);
+	snmp_register_mib(check_oid, OID_LENGTH(check_oid), "Healthchecker",
+			  (struct variable *)check_vars,
+			  sizeof(struct variable8),
+			  sizeof(check_vars)/sizeof(struct variable8));
 }
 
 void

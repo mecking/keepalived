@@ -23,7 +23,12 @@
 #ifndef _LOGGER_H
 #define _LOGGER_H
 
+#include <stdarg.h>
+#include <syslog.h>
+
 void enable_console_log(void);
-void log_message(int priority, char* format, ...);
+void vlog_message(const int facility, const char* format, va_list args);
+void log_message(int priority, const char* format, ...)
+	__attribute__ ((format (printf, 2, 3)));
 
 #endif

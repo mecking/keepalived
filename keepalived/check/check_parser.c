@@ -74,6 +74,24 @@ vs_handler(vector_t *strvec)
 	alloc_vs(vector_slot(strvec, 1), vector_slot(strvec, 2));
 }
 static void
+vs_end_handler(void)
+{
+	virtual_server_t *vs = LIST_TAIL_DATA(check_data->vs);
+	if (! vs->af)
+		vs->af = AF_INET;
+}
+static void
+ip_family_handler(vector_t *strvec)
+{
+	virtual_server_t *vs = LIST_TAIL_DATA(check_data->vs);
+	if (vs->af)
+		return;
+	if (0 == strcmp(vector_slot(strvec, 1), "inet"))
+		vs->af = AF_INET;
+	else if (0 == strcmp(vector_slot(strvec, 1), "inet6"))
+		vs->af = AF_INET6;
+}
+static void
 delay_handler(vector_t *strvec)
 {
 	virtual_server_t *vs = LIST_TAIL_DATA(check_data->vs);
@@ -168,6 +186,16 @@ static void
 ssvr_handler(vector_t *strvec)
 {
 	alloc_ssvr(vector_slot(strvec, 1), vector_slot(strvec, 2));
+}
+static void
+ssvri_handler(vector_t *strvec)
+{
+	virtual_server_t *vs = LIST_TAIL_DATA(check_data->vs);
+	if (vs->s_svr) {
+		vs->s_svr->inhibit = 1;
+	} else {
+		log_message(LOG_ERR, "Ignoring sorry_server_inhibit used before or without sorry_server");
+	}
 }
 
 /* Real Servers handlers */
@@ -289,6 +317,7 @@ check_init_keywords(void)
 	/* Virtual server mapping */
 	install_keyword_root("virtual_server_group", &vsg_handler);
 	install_keyword_root("virtual_server", &vs_handler);
+	install_keyword("ip_family", &ip_family_handler);
 	install_keyword("delay_loop", &delay_handler);
 	install_keyword("lb_algo", &lbalgo_handler);
 	install_keyword("lvs_sched", &lbalgo_handler);
@@ -312,6 +341,7 @@ check_init_keywords(void)
 
 	/* Real server mapping */
 	install_keyword("sorry_server", &ssvr_handler);
+	install_keyword("sorry_server_inhibit", &ssvri_handler);
 	install_keyword("real_server", &rs_handler);
 	install_sublevel();
 	install_keyword("weight", &weight_handler);
@@ -322,6 +352,8 @@ check_init_keywords(void)
 	install_keyword("inhibit_on_failure", &inhibit_handler);
 	install_keyword("notify_up", &notify_up_handler);
 	install_keyword("notify_down", &notify_down_handler);
+
+	install_sublevel_end_handler(&vs_end_handler);
 
 	/* Checkers mapping */
 	install_checkers_keyword();

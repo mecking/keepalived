@@ -49,13 +49,13 @@
 #define LVS_CMD_EDIT_DEST	IP_VS_SO_SET_EDITDEST
 
 /* prototypes */
-extern void perform_svr_state(int, virtual_server_t *, real_server_t *);
-extern void update_svr_wgt(int, virtual_server_t *, real_server_t *);
+extern int perform_svr_state(int, virtual_server_t *, real_server_t *);
+extern void update_svr_wgt(int, virtual_server_t *, real_server_t *, int);
 extern int svr_checker_up(checker_id_t, real_server_t *);
 extern void update_svr_checker_state(int, checker_id_t, virtual_server_t *, real_server_t *);
 extern int init_services(void);
 extern int clear_services(void);
 extern int clear_diff_services(void);
-extern int copy_srv_states(void);
+extern void link_vsg_to_vs(void);
 
 #endif

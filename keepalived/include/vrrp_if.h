@@ -70,6 +70,9 @@ struct ethtool_value {
 #define LB_MII     0x2
 #define LB_ETHTOOL 0x4
 
+/* Default values */
+#define IF_DEFAULT_BUFSIZE	(65*1024)
+
 /* Interface structure definition */
 typedef struct _interface {
 	char			ifname[IF_NAMESIZ + 1];	/* Interface name */
@@ -96,7 +99,9 @@ typedef struct _tracked_if {
 /* Macros */
 #define IF_NAME(X) ((X)->ifname)
 #define IF_INDEX(X) ((X)->ifindex)
+#define IF_BASE_INDEX(X) ((X)->base_ifindex)
 #define IF_ADDR(X) ((X)->sin_addr.s_addr)
+#define IF_ADDR6(X)	((X)->sin6_addr)
 #define IF_MTU(X) ((X)->mtu)
 #define IF_HWADDR(X) ((X)->hw_addr)
 #define IF_MII_SUPPORTED(X) ((X)->lb_type & LB_MII)
@@ -108,8 +113,9 @@ typedef struct _tracked_if {
 
 /* prototypes */
 extern interface_t *if_get_by_ifindex(const int);
-extern interface_t *if_get_by_vmac_base_ifindex(const int);
+extern interface_t *base_if_get_by_ifindex(const int);
 extern interface_t *if_get_by_ifname(const char *);
+extern void if_vmac_reflect_flags(const int, const unsigned long);
 extern int if_linkbeat(const interface_t *);
 extern int if_mii_probe(const char *);
 extern int if_ethtool_probe(const char *);
@@ -123,9 +129,12 @@ extern int if_join_vrrp_group(sa_family_t, int *, interface_t *, int);
 extern int if_leave_vrrp_group(sa_family_t, int, interface_t *);
 extern int if_setsockopt_bindtodevice(int *, interface_t *);
 extern int if_setsockopt_hdrincl(int *);
+extern int if_setsockopt_ipv6_checksum(int *);
 extern int if_setsockopt_mcast_loop(sa_family_t, int *);
 extern int if_setsockopt_mcast_hops(sa_family_t, int *);
 extern int if_setsockopt_mcast_if(sa_family_t, int *, interface_t *);
 extern int if_setsockopt_priority(int *);
+extern int if_setsockopt_sndbuf(int *, int);
+extern int if_setsockopt_rcvbuf(int *, int);
 
 #endif

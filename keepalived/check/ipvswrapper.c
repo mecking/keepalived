@@ -88,14 +88,25 @@ ipvs_talk(int cmd)
 	int result;
 	if (result = ipvs_command(cmd, urule))
 		if ((cmd == IP_VS_SO_SET_EDITDEST) &&
-		    (errno == ENOENT))
-			result = ipvs_command(IP_VS_SO_SET_ADDDEST, urule);
-	if (result)
+		    (errno == ENOENT)) {
+			cmd = IP_VS_SO_SET_ADDDEST;
+			result = ipvs_command(cmd, urule);
+		}
+	if (result) {
 		log_message(LOG_INFO, "IPVS : %s", ipvs_strerror(errno));
-	return IPVS_SUCCESS;
+		if (errno == EEXIST &&
+			(cmd == IP_VS_SO_SET_ADD || IP_VS_SO_SET_ADDDEST)
+		)
+			result = 0;
+		else if (errno == ENOENT &&
+			(cmd == IP_VS_SO_SET_DEL || IP_VS_SO_SET_DELDEST)
+		)
+			result = 0;
+	}
+	return result;
 }
 
-int
+void
 ipvs_syncd_cmd(int cmd, char *ifname, int state, int syncid)
 {
 #ifdef _HAVE_IPVS_SYNCD_
@@ -109,11 +120,10 @@ ipvs_syncd_cmd(int cmd, char *ifname, int state, int syncid)
 		strncpy(urule->mcast_ifn, ifname, IP_VS_IFNAME_MAXLEN);
 
 	/* Talk to the IPVS channel */
-	return ipvs_talk(cmd);
+	ipvs_talk(cmd);
 
 #else
 	log_message(LOG_INFO, "IPVS : Sync daemon not supported");
-	return IPVS_ERROR;
 #endif
 }
 
@@ -122,7 +132,6 @@ static int
 ipvs_group_range_cmd(int cmd, virtual_server_group_entry_t *vsg_entry)
 {
 	uint32_t addr_ip;
-	int err = 0;
 
 	/* Parse the whole range */
 	for (addr_ip = inet_sockaddrip4(&vsg_entry->addr);
@@ -132,24 +141,24 @@ ipvs_group_range_cmd(int cmd, virtual_server_group_entry_t *vsg_entry)
 		urule->vport = inet_sockaddrport(&vsg_entry->addr);
 
 		/* Talk to the IPVS channel */
-		err = ipvs_talk(cmd);
+		if (ipvs_talk(cmd))
+			return -1;
 	}
 
-	return err;
+	return 0;
 }
 
 /* set IPVS group rules */
 static int
-ipvs_group_cmd(int cmd, list vs_group, real_server_t * rs, char * vsgname)
+ipvs_group_cmd(int cmd, virtual_server_t * vs, real_server_t * rs)
 {
-	virtual_server_group_t *vsg = ipvs_get_group_by_name(vsgname, vs_group);
+	virtual_server_group_t *vsg = vs->vsg;
 	virtual_server_group_entry_t *vsg_entry;
 	list l;
 	element e;
-	int err = 1;
 
 	/* return if jointure fails */
-	if (!vsg) return -1;
+	if (!vsg) return 0;
 
 	/* visit addr_ip list */
 	l = vsg->addr_ip;
@@ -160,7 +169,8 @@ ipvs_group_cmd(int cmd, list vs_group, real_server_t * rs, char * vsgname)
 
 		/* Talk to the IPVS channel */
 		if (IPVS_ALIVE(cmd, vsg_entry, rs)) {
-			err = ipvs_talk(cmd);
+			if (ipvs_talk(cmd))
+				return -1;
 			IPVS_SET_ALIVE(cmd, vsg_entry);
 		}
 	}
@@ -175,7 +185,8 @@ ipvs_group_cmd(int cmd, list vs_group, real_server_t * rs, char * vsgname)
 
 		/* Talk to the IPVS channel */
 		if (IPVS_ALIVE(cmd, vsg_entry, rs)) {
-			err = ipvs_talk(cmd);
+			if (ipvs_talk(cmd))
+				return -1;
 			IPVS_SET_ALIVE(cmd, vsg_entry);
 		}
 	}
@@ -188,12 +199,13 @@ ipvs_group_cmd(int cmd, list vs_group, real_server_t * rs, char * vsgname)
 
 		/* Talk to the IPVS channel */
 		if (IPVS_ALIVE(cmd, vsg_entry, rs)) {
-			err = ipvs_group_range_cmd(cmd, vsg_entry);
+			if (ipvs_group_range_cmd(cmd, vsg_entry))
+				return -1;
 			IPVS_SET_ALIVE(cmd, vsg_entry);
 		}
 	}
 
-	return err;
+	return 0;
 }
 
 /* Fill IPVS rule with root vs infos */
@@ -210,9 +222,8 @@ ipvs_set_rule(int cmd, virtual_server_t * vs, real_server_t * rs)
 	urule->protocol = vs->service_type;
 
 	if (!parse_timeout(vs->timeout_persistence, &urule->timeout))
-		log_message(LOG_INFO, "IPVS : Virtual service [%s]:%d illegal timeout."
-				    , inet_ntop2(inet_sockaddrip4(&vs->addr))
-				    , ntohs(inet_sockaddrport(&vs->addr)));
+		log_message(LOG_INFO, "IPVS : Virtual service %s illegal timeout."
+					, FMT_VS(vs));
 
 	if (urule->timeout != 0 || vs->granularity_persistence)
 		urule->vs_flags = IP_VS_SVC_F_PERSISTENT;
@@ -235,7 +246,7 @@ ipvs_set_rule(int cmd, virtual_server_t * vs, real_server_t * rs)
 
 /* Set/Remove a RS from a VS */
 int
-ipvs_cmd(int cmd, list vs_group, virtual_server_t * vs, real_server_t * rs)
+ipvs_cmd(int cmd, virtual_server_t * vs, real_server_t * rs)
 {
 	int err = 0;
 
@@ -258,7 +269,7 @@ ipvs_cmd(int cmd, list vs_group, virtual_server_t * vs, real_server_t * rs)
 
 	/* Set vs rule and send to kernel */
 	if (vs->vsgname) {
-		err = ipvs_group_cmd(cmd, vs_group, rs, vs->vsgname);
+		err = ipvs_group_cmd(cmd, vs, rs);
 	} else {
 		if (vs->vfwmark) {
 			urule->vfwmark = vs->vfwmark;
@@ -274,12 +285,53 @@ ipvs_cmd(int cmd, list vs_group, virtual_server_t * vs, real_server_t * rs)
 	return err;
 }
 
+
+/* add alive destinations to the newly created vsge */
+void
+ipvs_group_sync_entry(virtual_server_t *vs, virtual_server_group_entry_t *vsge)
+{
+	real_server_t *rs;
+	element e;
+	list l = vs->rs;
+
+	/* Clean target rules */
+	memset(urule, 0, sizeof (struct ip_vs_rule_user));
+
+	/* Process realserver queue */
+	for (e = LIST_HEAD(l); e; ELEMENT_NEXT(e)) {
+		rs = ELEMENT_DATA(e);
+
+		if (rs->reloaded && (rs->alive || rs->inhibit && rs->set)) {
+			/* Prepare the IPVS rule */
+			if (urule->daddr) {
+				/* Setting IPVS rule with vs root rs */
+				ipvs_set_rule(IP_VS_SO_SET_ADDDEST, vs, rs);
+			} else {
+				urule->daddr = inet_sockaddrip4(&rs->addr);
+				urule->dport = inet_sockaddrport(&rs->addr);
+			}
+			urule->weight = rs->inhibit && ! rs->alive ? 0: rs->weight;
+
+			/* Set vs rule */
+			if (vsge->range) {
+				ipvs_group_range_cmd(IP_VS_SO_SET_ADDDEST, vsge);
+			} else {
+				urule->vfwmark = vsge->vfwmark;
+				urule->vaddr = inet_sockaddrip4(&vsge->addr);
+				urule->vport = inet_sockaddrport(&vsge->addr);
+
+				/* Talk to the IPVS channel */
+				ipvs_talk(IP_VS_SO_SET_ADDDEST);
+			}
+		}
+	}
+}
+
 /* Remove a specific vs group entry */
-int
+void
 ipvs_group_remove_entry(virtual_server_t *vs, virtual_server_group_entry_t *vsge)
 {
 	real_server_t *rs;
-	int err = 0;
 	element e;
 	list l = vs->rs;
 
@@ -310,17 +362,17 @@ ipvs_group_remove_entry(virtual_server_t *vs, virtual_server_group_entry_t *vsge
 				urule->vport = inet_sockaddrport(&vsge->addr);
 
 				/* Talk to the IPVS channel */
-				err = ipvs_talk(IP_VS_SO_SET_DELDEST);
+				ipvs_talk(IP_VS_SO_SET_DELDEST);
 			}
 		}
 	}
 
 	/* Remove VS entry */
 	if (vsge->range)
-		err = ipvs_group_range_cmd(IP_VS_SO_SET_DEL, vsge);
+		ipvs_group_range_cmd(IP_VS_SO_SET_DEL, vsge);
 	else
-		err = ipvs_talk(IP_VS_SO_SET_DEL);
-	return err;
+		ipvs_talk(IP_VS_SO_SET_DEL);
+	UNSET_ALIVE(vsge);
 }
 
 #else					/* KERNEL 2.6 IPVS handling */
@@ -362,7 +414,7 @@ ipvs_stop(void)
 }
 
 /* Send user rules to IPVS module */
-static void
+static int
 ipvs_talk(int cmd)
 {
 	int result = -1;
@@ -394,16 +446,28 @@ ipvs_talk(int cmd)
 			break;
 		case IP_VS_SO_SET_EDITDEST:
 			if ((result = ipvs_update_dest(srule, drule)) &&
-			    (errno == ENOENT))
+			    (errno == ENOENT)) {
+				cmd = IP_VS_SO_SET_ADDDEST;
 				result = ipvs_add_dest(srule, drule);
+			}
 			break;
 	}
 
-	if (result)
+	if (result) {
 		log_message(LOG_INFO, "IPVS: %s", ipvs_strerror(errno));
+		if (errno == EEXIST &&
+			(cmd == IP_VS_SO_SET_ADD || IP_VS_SO_SET_ADDDEST)
+		)
+			result = 0;
+		else if (errno == ENOENT &&
+			(cmd == IP_VS_SO_SET_DEL || IP_VS_SO_SET_DELDEST)
+		)
+			result = 0;
+	}
+	return result;
 }
 
-int
+void
 ipvs_syncd_cmd(int cmd, char *ifname, int state, int syncid)
 {
 	memset(daemonrule, 0, sizeof(ipvs_daemon_t));
@@ -416,11 +480,10 @@ ipvs_syncd_cmd(int cmd, char *ifname, int state, int syncid)
 
 	/* Talk to the IPVS channel */
 	ipvs_talk(cmd);
-	return IPVS_SUCCESS;
 }
 
 /* IPVS group range rule */
-static void
+static int
 ipvs_group_range_cmd(int cmd, virtual_server_group_entry_t *vsg_entry)
 {
 	uint32_t addr_ip, ip;
@@ -449,21 +512,24 @@ ipvs_group_range_cmd(int cmd, virtual_server_group_entry_t *vsg_entry)
 		srule->port = inet_sockaddrport(&vsg_entry->addr);
 
 		/* Talk to the IPVS channel */
-		ipvs_talk(cmd);
+		if (ipvs_talk(cmd))
+			return -1;
 	}
+
+	return 0;
 }
 
 /* set IPVS group rules */
-static void
-ipvs_group_cmd(int cmd, list vs_group, real_server_t * rs, virtual_server_t * vs)
+static int
+ipvs_group_cmd(int cmd, virtual_server_t * vs, real_server_t * rs)
 {
-	virtual_server_group_t *vsg = ipvs_get_group_by_name(vs->vsgname, vs_group);
+	virtual_server_group_t *vsg = vs->vsg;
 	virtual_server_group_entry_t *vsg_entry;
 	list l;
 	element e;
 
 	/* return if jointure fails */
-	if (!vsg) return;
+	if (!vsg) return 0;
 
 	/* visit addr_ip list */
 	l = vsg->addr_ip;
@@ -480,7 +546,8 @@ ipvs_group_cmd(int cmd, list vs_group, real_server_t * rs, virtual_server_t * vs
 
 		/* Talk to the IPVS channel */
 		if (IPVS_ALIVE(cmd, vsg_entry, rs)) {
-			ipvs_talk(cmd);
+			if (ipvs_talk(cmd))
+				return -1;
 			IPVS_SET_ALIVE(cmd, vsg_entry);
 		}
 	}
@@ -492,18 +559,15 @@ ipvs_group_cmd(int cmd, list vs_group, real_server_t * rs, virtual_server_t * vs
 	srule->port = 0;
 	for (e = LIST_HEAD(l); e; ELEMENT_NEXT(e)) {
 		vsg_entry = ELEMENT_DATA(e);
-		srule->af = AF_INET;
-		/* Need to get address family from first real server */
-		if (vs->rs && !LIST_ISEMPTY(vs->rs) &&
-		    (((real_server_t *)ELEMENT_DATA(LIST_HEAD(vs->rs)))->addr.ss_family == AF_INET6)) {
-			srule->af = AF_INET6;
+		srule->af = vs->af;
+		if (vs->af == AF_INET6)
 			srule->netmask = 128;
-		}
 		srule->fwmark = vsg_entry->vfwmark;
 
 		/* Talk to the IPVS channel */
 		if (IPVS_ALIVE(cmd, vsg_entry, rs)) {
-			ipvs_talk(cmd);
+			if (ipvs_talk(cmd))
+				return -1;
 			IPVS_SET_ALIVE(cmd, vsg_entry);
 		}
 	}
@@ -516,10 +580,12 @@ ipvs_group_cmd(int cmd, list vs_group, real_server_t * rs, virtual_server_t * vs
 
 		/* Talk to the IPVS channel */
 		if (IPVS_ALIVE(cmd, vsg_entry, rs)) {
-			ipvs_group_range_cmd(cmd, vsg_entry);
+			if (ipvs_group_range_cmd(cmd, vsg_entry))
+				return -1;
 			IPVS_SET_ALIVE(cmd, vsg_entry);
 		}
 	}
+	return 0;
 }
 
 /* Fill IPVS rule with root vs infos */
@@ -538,9 +604,8 @@ ipvs_set_rule(int cmd, virtual_server_t * vs, real_server_t * rs)
 	srule->protocol = vs->service_type;
 
 	if (!parse_timeout(vs->timeout_persistence, &srule->timeout))
-		log_message(LOG_INFO, "IPVS : Virtual service [%s]:%d illegal timeout."
-				    , inet_ntop2(inet_sockaddrip4(&vs->addr))
-				    , ntohs(inet_sockaddrport(&vs->addr)));
+		log_message(LOG_INFO, "IPVS : Virtual service %s illegal timeout."
+				    , FMT_VS(vs));
 
 	if (srule->timeout != 0 || vs->granularity_persistence)
 		srule->flags |= IP_VS_SVC_F_PERSISTENT;
@@ -572,8 +637,10 @@ ipvs_set_rule(int cmd, virtual_server_t * vs, real_server_t * rs)
 
 /* Set/Remove a RS from a VS */
 int
-ipvs_cmd(int cmd, list vs_group, virtual_server_t * vs, real_server_t * rs)
+ipvs_cmd(int cmd, virtual_server_t * vs, real_server_t * rs)
 {
+	int err = 0;
+
 	/* Allocate the room */
 	memset(srule, 0, sizeof(ipvs_service_t));
 	ipvs_set_rule(cmd, vs, rs);
@@ -594,20 +661,15 @@ ipvs_cmd(int cmd, list vs_group, virtual_server_t * vs, real_server_t * rs)
 
 	/* Set vs rule and send to kernel */
 	if (vs->vsgname) {
-		ipvs_group_cmd(cmd, vs_group, rs, vs);
+		err = ipvs_group_cmd(cmd, vs, rs);
 	} else {
+		srule->af = vs->af;
 		if (vs->vfwmark) {
-			srule->af = AF_INET;
-			/* Need to get address family from first real server */
-			if (vs->rs && !LIST_ISEMPTY(vs->rs) &&
-			    (((real_server_t *)ELEMENT_DATA(LIST_HEAD(vs->rs)))->addr.ss_family == AF_INET6)) {
-				srule->af = AF_INET6;
+			if (vs->af == AF_INET6)
 				srule->netmask = 128;
-			}
 			srule->fwmark = vs->vfwmark;
 		} else {
-			srule->af = vs->addr.ss_family;
-			if (vs->addr.ss_family == AF_INET6)
+			if (vs->af == AF_INET6)
 				inet_sockaddrip6(&vs->addr, &srule->addr.in6);
 			else
 				srule->addr.ip = inet_sockaddrip4(&vs->addr);
@@ -615,14 +677,66 @@ ipvs_cmd(int cmd, list vs_group, virtual_server_t * vs, real_server_t * rs)
 		}
 
 		/* Talk to the IPVS channel */
-		ipvs_talk(cmd);
+		err = ipvs_talk(cmd);
 	}
 
-	return IPVS_SUCCESS;
+	return err;
+}
+
+/* add alive destinations to the newly created vsge */
+void
+ipvs_group_sync_entry(virtual_server_t *vs, virtual_server_group_entry_t *vsge)
+{
+	real_server_t *rs;
+	element e;
+	list l = vs->rs;
+
+	/* Clean target rules */
+	memset(srule, 0, sizeof(ipvs_service_t));
+	memset(drule, 0, sizeof(ipvs_dest_t));
+
+	/* Process realserver queue */
+	for (e = LIST_HEAD(l); e; ELEMENT_NEXT(e)) {
+		rs = ELEMENT_DATA(e);
+
+		if (rs->reloaded && (rs->alive || (rs->inhibit && rs->set))) {
+			/* Prepare the IPVS rule */
+			if (!drule->addr.ip) {
+				/* Setting IPVS rule with vs root rs */
+				ipvs_set_rule(IP_VS_SO_SET_ADDDEST, vs, rs);
+			} else {
+				drule->af = rs->addr.ss_family;
+				if (rs->addr.ss_family == AF_INET6)
+					inet_sockaddrip6(&rs->addr, &drule->addr.in6);
+				else
+					drule->addr.ip = inet_sockaddrip4(&rs->addr);
+				drule->port = inet_sockaddrport(&rs->addr);
+			}
+			drule->weight = rs->inhibit && ! rs->alive ? 0: rs->weight;
+
+			/* Set vs rule */
+			if (vsge->range) {
+				ipvs_group_range_cmd(IP_VS_SO_SET_ADDDEST, vsge);
+			} else {
+				srule->af = vsge->addr.ss_family;
+				if (vsge->addr.ss_family == AF_INET6)
+					inet_sockaddrip6(&vsge->addr, &srule->addr.in6);
+				else
+					srule->addr.ip = inet_sockaddrip4(&vsge->addr);
+				srule->port = inet_sockaddrport(&vsge->addr);
+				srule->fwmark = vsge->vfwmark;
+				drule->u_threshold = rs->u_threshold;
+				drule->l_threshold = rs->l_threshold;
+
+				/* Talk to the IPVS channel */
+				ipvs_talk(IP_VS_SO_SET_ADDDEST);
+			}
+		}
+	}
 }
 
 /* Remove a specific vs group entry */
-int
+void
 ipvs_group_remove_entry(virtual_server_t *vs, virtual_server_group_entry_t *vsge)
 {
 	real_server_t *rs;
@@ -677,8 +791,7 @@ ipvs_group_remove_entry(virtual_server_t *vs, virtual_server_group_entry_t *vsge
 		ipvs_group_range_cmd(IP_VS_SO_SET_DEL, vsge);
 	else
 		ipvs_talk(IP_VS_SO_SET_DEL);
-
-	return IPVS_SUCCESS;
+	UNSET_ALIVE(vsge);
 }
 
 #ifdef _WITH_SNMP_

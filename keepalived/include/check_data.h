@@ -71,6 +71,8 @@ typedef struct _real_server {
 	struct sockaddr_storage		addr;
 	int				weight;
 	int				iweight;	/* Initial weight */
+	int 				pweight;	/* previous weight
+							 * used for reloading */
 #ifdef _KRNL_2_6_
 	uint32_t			u_threshold;   /* Upper connection limit. */
 	uint32_t			l_threshold;   /* Lower connection limit. */
@@ -83,7 +85,7 @@ typedef struct _real_server {
 	int				alive;
 	list				failed_checkers;/* List of failed checkers */
 	int				set;		/* in the IPVS table */
-	int				reloaded;   /* active state was copied from old config while reloading */
+	int				reloaded;	/* active state was copied from old config while reloading */
 #if defined(_WITH_SNMP_) && defined(_KRNL_2_6_) && defined(_WITH_LVS_)
 	/* Statistics */
 	uint32_t			activeconns;	/* active connections */
@@ -99,6 +101,7 @@ typedef struct _virtual_server_group_entry {
 	uint8_t				range;
 	uint32_t			vfwmark;
 	int				alive;
+	int				reloaded;
 } virtual_server_group_entry_t;
 
 typedef struct _virtual_server_group {
@@ -111,9 +114,11 @@ typedef struct _virtual_server_group {
 /* Virtual Server definition */
 typedef struct _virtual_server {
 	char				*vsgname;
+	virtual_server_group_t		*vsg;
 	struct sockaddr_storage		addr;
 	real_server_t			*s_svr;
 	uint32_t			vfwmark;
+	uint16_t			af;
 	uint16_t			service_type;
 	long				delay_loop;
 	int				ha_suspend;
@@ -134,7 +139,7 @@ typedef struct _virtual_server {
 
 	long unsigned			hysteresis;	/* up/down events "lag" WRT quorum. */
 	unsigned			quorum_state;	/* Reflects result of the last transition done. */
-	int					reloaded;   /* quorum_state was copied from old config while reloading */
+	int				reloaded;	/* quorum_state was copied from old config while reloading */
 #if defined(_WITH_SNMP_) && defined(_KRNL_2_6_) && defined(_WITH_LVS_)
 	/* Statistics */
 	time_t				lastupdated;
@@ -210,9 +215,12 @@ static inline int inaddr_equal(sa_family_t family, void *addr1, void *addr2)
 #define SET_ALIVE(S)	((S)->alive = 1)
 #define UNSET_ALIVE(S)	((S)->alive = 0)
 #define VHOST(V)	((V)->virtualhost)
+#define FMT_RS(R) (inet_sockaddrtopair (&(R)->addr))
+#define FMT_VS(V) (format_vs((V)))
 
 #define VS_ISEQ(X,Y)	(sockstorage_equal(&(X)->addr,&(Y)->addr)			&&\
 			 (X)->vfwmark                 == (Y)->vfwmark			&&\
+			 (X)->af                      == (Y)->af                        &&\
 			 (X)->service_type            == (Y)->service_type		&&\
 			 (X)->loadbalancing_kind      == (Y)->loadbalancing_kind	&&\
 			 (X)->nat_mask                == (Y)->nat_mask			&&\
@@ -230,8 +238,7 @@ static inline int inaddr_equal(sa_family_t family, void *addr1, void *addr2)
 			 (X)->range     == (Y)->range &&		\
 			 (X)->vfwmark   == (Y)->vfwmark)
 
-#define RS_ISEQ(X,Y)	(sockstorage_equal(&(X)->addr,&(Y)->addr) &&	\
-			 (X)->iweight   == (Y)->iweight)
+#define RS_ISEQ(X,Y)	(sockstorage_equal(&(X)->addr,&(Y)->addr))
 
 /* Global vars exported */
 extern check_data_t *check_data;
@@ -251,5 +258,6 @@ extern void set_rsgroup(char *);
 extern check_data_t *alloc_check_data(void);
 extern void free_check_data(check_data_t *);
 extern void dump_check_data(check_data_t *);
+extern char *format_vs (virtual_server_t *);
 
 #endif

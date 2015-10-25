@@ -34,6 +34,7 @@
 #include "logger.h"
 #include "parser.h"
 #include "memory.h"
+#include "bitops.h"
 
 /* Static addresses handler */
 static void
@@ -110,30 +111,41 @@ static void
 vrrp_vmac_handler(vector_t *strvec)
 {
 	vrrp_t *vrrp = LIST_TAIL_DATA(vrrp_data->vrrp);
-	vrrp->vmac = 1;
-	if (!vrrp->mcast_saddr)
-		vrrp->mcast_saddr  = IF_ADDR(vrrp->ifp);
+	interface_t *ifp = vrrp->ifp;
+	struct sockaddr_storage *saddr = &vrrp->saddr;
+
+	__set_bit(VRRP_VMAC_BIT, &vrrp->vmac_flags);
+	if (!vrrp->saddr.ss_family) {
+		if (!ifp) {
+			log_message(LOG_INFO, "Please define interface keyword before use_vmac keyword");
+			return;
+		} else {
+			if (vrrp->family == AF_INET) {
+				inet_ip4tosockaddr(&ifp->sin_addr, saddr);
+			} else if (vrrp->family == AF_INET6) {
+				inet_ip6tosockaddr(&ifp->sin6_addr, saddr);
+				/* IPv6 use-case: Binding to link-local address requires an interface */
+				inet_ip6scopeid(IF_INDEX(ifp), saddr);
+			}
+		}
+	}
 	if (vector_size(strvec) == 2) {
 		strncpy(vrrp->vmac_ifname, vector_slot(strvec, 1),
 			IFNAMSIZ - 1);
 	} else if (vrrp->vrid) {
 		snprintf(vrrp->vmac_ifname, IFNAMSIZ, "vrrp.%d", vrrp->vrid);
+	} else {
+		return;
 	}
 
-	if (strlen(vrrp->vmac_ifname)) {
-		log_message(LOG_INFO, "vmac_ifname=%s for vrrp_instace %s"
-				    , vrrp->vmac_ifname
-				    , vrrp->iname);
-	}
-	if (vrrp->ifp && !(vrrp->vmac & 2)) {
-		unsigned int base_ifindex = vrrp->ifp->base_ifindex;
-		netlink_link_add_vmac(vrrp);
-		/* restore base ifindex (deleted when adding VMAC) */
-		vrrp->ifp->base_ifindex = base_ifindex;
-        }
-
-        /* flag interface as a VMAC interface */
-        vrrp->ifp->vmac = 1;
+	netlink_link_add_vmac(vrrp);
+}
+static void
+vrrp_vmac_xmit_base_handler(vector_t *strvec)
+{
+	vrrp_t *vrrp = LIST_TAIL_DATA(vrrp_data->vrrp);
+	if (__test_bit(VRRP_VMAC_BIT, &vrrp->vmac_flags))
+		__set_bit(VRRP_VMAC_XMITBASE_BIT, &vrrp->vmac_flags);
 }
 static void
 vrrp_unicast_peer_handler(vector_t *strvec)
@@ -145,6 +157,9 @@ vrrp_native_ipv6_handler(vector_t *strvec)
 {
 	vrrp_t *vrrp = LIST_TAIL_DATA(vrrp_data->vrrp);
 	vrrp->family = AF_INET6;
+
+	if (__test_bit(VRRP_VMAC_BIT, &vrrp->vmac_flags))
+		log_message(LOG_INFO, "You should declare native_ipv6 before use_vmac!");
 
 	if (vrrp->auth_type != VRRP_AUTH_NONE)
 		vrrp->auth_type = VRRP_AUTH_NONE;
@@ -170,15 +185,16 @@ vrrp_int_handler(vector_t *strvec)
 {
 	vrrp_t *vrrp = LIST_TAIL_DATA(vrrp_data->vrrp);
 	char *name = vector_slot(strvec, 1);
-	unsigned int ifindex;
 
 	vrrp->ifp = if_get_by_ifname(name);
-	ifindex = vrrp->ifp->ifindex;
-	if (vrrp->vmac && !(vrrp->vmac & 2))
-		netlink_link_add_vmac(vrrp);
+	if (!vrrp->ifp) {
+		log_message(LOG_INFO, "Cant find interface %s for vrrp_instance %s !!!"
+				    , name, vrrp->iname);
+		return;
+	}
 
-	/* save base ifindex (only used for VMAC interfaces) */
-	vrrp->ifp->base_ifindex = ifindex;
+	if (__test_bit(VRRP_VMAC_BIT, &vrrp->vmac_flags))
+		netlink_link_add_vmac(vrrp);
 }
 static void
 vrrp_track_int_handler(vector_t *strvec)
@@ -197,10 +213,37 @@ vrrp_dont_track_handler(vector_t *strvec)
 	vrrp->dont_track_primary = 1;
 }
 static void
-vrrp_mcastip_handler(vector_t *strvec)
+vrrp_srcip_handler(vector_t *strvec)
 {
 	vrrp_t *vrrp = LIST_TAIL_DATA(vrrp_data->vrrp);
-	inet_ston(vector_slot(strvec, 1), &vrrp->mcast_saddr);
+	interface_t *ifp = vrrp->ifp;
+	struct sockaddr_storage *saddr = &vrrp->saddr;
+	int ret;
+
+	ret = inet_stosockaddr(vector_slot(strvec, 1), 0, saddr);
+	if (ret < 0) {
+		log_message(LOG_ERR, "Configuration error: VRRP instance[%s] malformed unicast"
+				     " src address[%s]. Skipping..."
+				   , vrrp->iname, FMT_STR_VSLOT(strvec, 1));
+		return;
+	}
+
+	if (saddr->ss_family != vrrp->family) {
+		log_message(LOG_ERR, "Configuration error: VRRP instance[%s] and unicast src address"
+				     "[%s] MUST be of the same family !!! Skipping..."
+				   , vrrp->iname, FMT_STR_VSLOT(strvec, 1));
+		memset(saddr, 0, sizeof(struct sockaddr_storage));
+	}
+
+	/* IPv6 use-case: Binding to link-local address requires an interface.
+	 * Just specify scope_id for all address types */
+	if (saddr->ss_family == AF_INET6) {
+		if (!ifp) {
+			log_message(LOG_INFO, "Please define interface keyword before mcast_src_ip keyword");
+			return;
+		}
+		inet_ip6scopeid(IF_INDEX(ifp), saddr);
+	}
 }
 static void
 vrrp_vrid_handler(vector_t *strvec)
@@ -214,12 +257,10 @@ vrrp_vrid_handler(vector_t *strvec)
 		       "             must be between 1 & 255. reconfigure !");
 	} else {
 		alloc_vrrp_bucket(vrrp);
-		if (vrrp->vmac && strlen(vrrp->vmac_ifname) == 0) {
-			snprintf(vrrp->vmac_ifname, IFNAMSIZ, "vrrp.%d"
-						  , vrrp->vrid);
-			log_message(LOG_INFO, "vmac_ifname=%s for vrrp_instace %s"
-					    , vrrp->vmac_ifname
-					    , vrrp->iname);
+		if (__test_bit(VRRP_VMAC_BIT, &vrrp->vmac_flags)) {
+			if (strlen(vrrp->vmac_ifname) == 0)
+				snprintf(vrrp->vmac_ifname, IFNAMSIZ, "vrrp.%d", vrrp->vrid);
+			netlink_link_add_vmac(vrrp);
 		}
 	}
 }
@@ -242,16 +283,16 @@ static void
 vrrp_adv_handler(vector_t *strvec)
 {
 	vrrp_t *vrrp = LIST_TAIL_DATA(vrrp_data->vrrp);
-	vrrp->adver_int = atoi(vector_slot(strvec, 1));
+	vrrp->adver_int = atof(vector_slot(strvec, 1)) * 100; /* multiply with 100 to get decimal value */
 
+	/* Simple check. Note that using VRRPv2 with 0.01s advert interval will not report an error */
 	if (VRRP_IS_BAD_ADVERT_INT(vrrp->adver_int)) {
 		log_message(LOG_INFO, "VRRP Error : Advert interval not valid !");
-		log_message(LOG_INFO,
-		       "             must be between less than 1sec.");
+		log_message(LOG_INFO, "             must be >=1sec for VRRPv2 or >=0.01sec for VRRPv3.\n");
 		log_message(LOG_INFO, "             Using default value : 1sec");
-		vrrp->adver_int = 1;
+		vrrp->adver_int = 100;
 	}
-	vrrp->adver_int *= TIMER_HZ;
+	vrrp->adver_int *= TIMER_HZ / 100.0;
 }
 static void
 vrrp_debug_handler(vector_t *strvec)
@@ -346,6 +387,28 @@ vrrp_garp_delay_handler(vector_t *strvec)
 	vrrp->garp_delay = atoi(vector_slot(strvec, 1)) * TIMER_HZ;
 	if (vrrp->garp_delay < TIMER_HZ)
 		vrrp->garp_delay = TIMER_HZ;
+}
+static void
+vrrp_garp_refresh_handler(vector_t *strvec)
+{
+	vrrp_t *vrrp = LIST_TAIL_DATA(vrrp_data->vrrp);
+	vrrp->garp_refresh.tv_sec = atoi(vector_slot(strvec, 1));
+}
+static void
+vrrp_garp_rep_handler(vector_t *strvec)
+{
+	vrrp_t *vrrp = LIST_TAIL_DATA(vrrp_data->vrrp);
+	vrrp->garp_rep = atoi(vector_slot(strvec, 1));
+	if (vrrp->garp_rep < 1)
+		vrrp->garp_rep = 1;
+}
+static void
+vrrp_garp_refresh_rep_handler(vector_t *strvec)
+{
+	vrrp_t *vrrp = LIST_TAIL_DATA(vrrp_data->vrrp);
+	vrrp->garp_refresh_rep = atoi(vector_slot(strvec, 1));
+	if (vrrp->garp_refresh_rep < 1)
+		vrrp->garp_refresh_rep = 1;
 }
 static void
 vrrp_auth_type_handler(vector_t *strvec)
@@ -474,6 +537,28 @@ vrrp_vscript_fall_handler(vector_t *strvec)
 		vscript->fall = 1;
 }
 
+static void
+vrrp_version_handler(vector_t *strvec)
+{
+	vrrp_t *vrrp = LIST_TAIL_DATA(vrrp_data->vrrp);
+
+	uint8_t version = atoi(vector_slot(strvec, 1));
+	if (VRRP_IS_BAD_VERSION(version)) {
+		log_message(LOG_INFO, "VRRP Error : Version not valid !\n");
+		log_message(LOG_INFO, "             must be between either 2 or 3. reconfigure !\n");
+		return;
+	}
+	vrrp->version = version;
+}
+
+static void
+vrrp_accept_handler(vector_t *strvec)
+{
+	vrrp_t *vrrp = LIST_TAIL_DATA(vrrp_data->vrrp);
+
+	vrrp->accept = true;
+}
+
 vector_t *
 vrrp_init_keywords(void)
 {
@@ -495,6 +580,7 @@ vrrp_init_keywords(void)
 	install_keyword("global_tracking", &vrrp_gglobal_tracking_handler);
 	install_keyword_root("vrrp_instance", &vrrp_handler);
 	install_keyword("use_vmac", &vrrp_vmac_handler);
+	install_keyword("vmac_xmit_base", &vrrp_vmac_xmit_base_handler);
 	install_keyword("unicast_peer", &vrrp_unicast_peer_handler);
 	install_keyword("native_ipv6", &vrrp_native_ipv6_handler);
 	install_keyword("state", &vrrp_state_handler);
@@ -502,13 +588,16 @@ vrrp_init_keywords(void)
 	install_keyword("dont_track_primary", &vrrp_dont_track_handler);
 	install_keyword("track_interface", &vrrp_track_int_handler);
 	install_keyword("track_script", &vrrp_track_scr_handler);
-	install_keyword("mcast_src_ip", &vrrp_mcastip_handler);
+	install_keyword("mcast_src_ip", &vrrp_srcip_handler);
+	install_keyword("unicast_src_ip", &vrrp_srcip_handler);
 	install_keyword("virtual_router_id", &vrrp_vrid_handler);
+	install_keyword("version", &vrrp_version_handler);
 	install_keyword("priority", &vrrp_prio_handler);
 	install_keyword("advert_int", &vrrp_adv_handler);
 	install_keyword("virtual_ipaddress", &vrrp_vip_handler);
 	install_keyword("virtual_ipaddress_excluded", &vrrp_evip_handler);
 	install_keyword("virtual_routes", &vrrp_vroutes_handler);
+	install_keyword("accept", &vrrp_accept_handler);
 	install_keyword("preempt", &vrrp_preempt_handler);
 	install_keyword("nopreempt", &vrrp_nopreempt_handler);
 	install_keyword("preempt_delay", &vrrp_preempt_delay_handler);
@@ -521,6 +610,9 @@ vrrp_init_keywords(void)
 	install_keyword("smtp_alert", &vrrp_smtp_handler);
 	install_keyword("lvs_sync_daemon_interface", &vrrp_lvs_syncd_handler);
 	install_keyword("garp_master_delay", &vrrp_garp_delay_handler);
+	install_keyword("garp_master_refresh", &vrrp_garp_refresh_handler);
+	install_keyword("garp_master_repeat", &vrrp_garp_rep_handler);
+	install_keyword("garp_master_refresh_repeat", &vrrp_garp_refresh_rep_handler);
 	install_keyword("authentication", NULL);
 	install_sublevel();
 	install_keyword("auth_type", &vrrp_auth_type_handler);
